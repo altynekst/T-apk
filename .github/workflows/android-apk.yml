@@ -193,6 +193,12 @@ jobs:
             if [ ! -f "$f" ]; then echo "MISSING: $f"; missing=1; fi
           done
           if [ ! -d ddnet-libs/sdl/java/org ]; then echo "MISSING dir: ddnet-libs/sdl/java/org"; missing=1; fi
+          # заголовки boringssl обязательны: FindCrypto ищет openssl/*.h
+          # в ddnet-libs/boringssl/include[/android]/openssl
+          if [ ! -f ddnet-libs/boringssl/include/android/openssl/base.h ] && [ ! -f ddnet-libs/boringssl/include/openssl/base.h ]; then
+            echo "MISSING: ddnet-libs/boringssl/include[/android]/openssl/base.h"
+            missing=1
+          fi
           if [ "$missing" = 1 ]; then
             echo "::error::ddnet-libs: нет прекомпилированных arm64-библиотек"
             exit 1
@@ -226,6 +232,60 @@ jobs:
           else
             echo "SDL-java без BLUETOOTH_CONNECT — патч не нужен"
           fi
+
+      - name: Patch FindCrypto (boringssl prebuilts для 16.x/17.x)
+        run: |
+          # DDNet 16.x/17.x: cmake/FindCrypto.cmake на android ищет крипту в
+          # ddnet-libs/openssl/ и требует заголовки openssl/opensslconf.h +
+          # openssl/configuration.h. ddnet-libs по актуальным пинам содержит
+          # BoringSSL: ddnet-libs/boringssl/android/libarm64/{libcrypto,libssl}.a
+          # и заголовки в boringssl/include/<TARGET_OS>/openssl/. Файла
+          # configuration.h у BoringSSL НЕТ (это OpenSSL 3.x), поэтому
+          # find_path переводим на ssl.h/base.h/hkdf.h/opensslconf.h — как в
+          # FindCrypto DDNet 18+. Из OpenSSL-API 17.x использует только
+          # SHA256 (src/base/hash.cpp) — в BoringSSL он есть; libcurl.a с
+          # этого же пина собран против этого же boringssl -> линкуется чисто.
+          FC=cmake/FindCrypto.cmake
+          if [ ! -f "$FC" ]; then
+            echo "::warning::$FC не найден — патч FindCrypto пропущен"
+            exit 0
+          fi
+          if grep -q boringssl "$FC"; then
+            echo "FindCrypto уже на boringssl (DDNet 18+) — патч не нужен"
+            exit 0
+          fi
+          python3 - "$FC" <<'PYEOF'
+          import sys
+          p = sys.argv[1]
+          s = open(p, encoding="utf-8").read()
+          OLD1 = "set_extra_dirs_lib(CRYPTO openssl)"
+          NEW1 = "set_extra_dirs_lib(CRYPTO boringssl)"
+          OLD2 = "set_extra_dirs_include(CRYPTO openssl \"${CRYPTO_LIBRARY}\")"
+          NEW2 = "set_extra_dirs_include(CRYPTO boringssl \"${CRYPTO_LIBRARY}\")"
+          OLD3 = "  find_path(CRYPTO_INCLUDEDIR1 openssl/opensslconf.h\n    PATH_SUFFIXES CRYPTO\n    HINTS ${HINTS_CRYPTO_INCLUDEDIR} ${PC_CRYPTO_INCLUDEDIR} ${PC_CRYPTO_INCLUDE_DIRS}\n    PATHS ${PATHS_CRYPTO_INCLUDEDIR}\n    ${CROSSCOMPILING_NO_CMAKE_SYSTEM_PATH}\n  )\n  find_path(CRYPTO_INCLUDEDIR2 openssl/configuration.h\n    PATH_SUFFIXES CRYPTO\n    HINTS ${HINTS_CRYPTO_INCLUDEDIR} ${PC_CRYPTO_INCLUDEDIR} ${PC_CRYPTO_INCLUDE_DIRS}\n    PATHS ${PATHS_CRYPTO_INCLUDEDIR}\n    ${CROSSCOMPILING_NO_CMAKE_SYSTEM_PATH}\n  )\n  set(CRYPTO_INCLUDEDIR ${CRYPTO_INCLUDEDIR1} ${CRYPTO_INCLUDEDIR2})"
+          NEW3 = "  find_path(CRYPTO_INCLUDEDIR openssl/ssl.h openssl/base.h openssl/hkdf.h openssl/opensslconf.h\n    PATH_SUFFIXES CRYPTO\n    HINTS ${HINTS_CRYPTO_INCLUDEDIR} ${PC_CRYPTO_INCLUDEDIR} ${PC_CRYPTO_INCLUDE_DIRS}\n    PATHS ${PATHS_CRYPTO_INCLUDEDIR}\n    ${CROSSCOMPILING_NO_CMAKE_SYSTEM_PATH}\n  )"
+          n = 0
+          if OLD1 in s:
+              s = s.replace(OLD1, NEW1)
+              n = n + 1
+              print("FindCrypto: папка библиотек openssl -> boringssl — ok")
+          else:
+              print("::warning::FindCrypto: шаблон 1 (set_extra_dirs_lib) не найден")
+          if OLD2 in s:
+              s = s.replace(OLD2, NEW2)
+              n = n + 1
+              print("FindCrypto: папка заголовков openssl -> boringssl — ok")
+          else:
+              print("::warning::FindCrypto: шаблон 2 (set_extra_dirs_include) не найден")
+          if OLD3 in s:
+              s = s.replace(OLD3, NEW3)
+              n = n + 1
+              print("FindCrypto: find_path opensslconf.h+configuration.h -> ssl.h/base.h/hkdf.h/opensslconf.h — ok")
+          else:
+              print("::warning::FindCrypto: шаблон 3 (find_path) не найден")
+          open(p, "w", encoding="utf-8").write(s)
+          print("FindCrypto: применено замен %d/3" % n)
+          PYEOF
 
       - name: Detect layout (LEGACY 16.x/17.x или modern 18+)
         run: |
