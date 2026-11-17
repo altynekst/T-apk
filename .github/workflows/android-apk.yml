@@ -158,52 +158,89 @@ jobs:
           fi
           echo "ddnet-libs: все arm64-библиотеки на месте"
 
+      - name: Detect layout (LEGACY 16.x/17.x или modern 18+)
+        run: |
+          if [ -f scripts/android/files/gradle-wrapper.jar ]; then
+            LEGACY=1
+            echo "layout: LEGACY (плоский gradle-проект, как в DDNet 16.x/17.x)"
+          else
+            LEGACY=0
+            echo "layout: modern (files/gradle/wrapper + gradlew, как в DDNet 18+)"
+          fi
+          VN=$(grep -m1 '#define GAME_RELEASE_VERSION_INTERNAL' src/game/version.h | awk '{print $3}' | tr -d '"' | tr '_' '.' || true)
+          if [ -z "$VN" ]; then VN=$(grep -m1 -E '^#define[[:space:]]+GAME_RELEASE_VERSION[[:space:]]+"' src/game/version.h | sed -E 's/.*"([^"]*)".*/\1/' | tr '_' '.' || true); fi
+          if [ -z "$VN" ]; then VN="unknown"; fi
+          echo "LEGACY=$LEGACY" >> "$GITHUB_ENV"
+          echo "базовая версия DDNet: $VN"
+
       - name: Fail-fast check (android project files)
         run: |
           missing=0
-          for f in \
-            CMakeLists.txt \
-            src/game/version.h \
-            scripts/compile_libs/_build_common.sh \
-            scripts/android/cmake_android.sh \
-            scripts/android/download_android_sdk.sh \
-            scripts/android/generate_asset_integrity_index.py \
-            scripts/android/files/build.sh \
-            scripts/android/files/build.gradle \
-            scripts/android/files/settings.gradle \
-            scripts/android/files/gradle.properties \
-            scripts/android/files/proguard-rules.pro \
-            scripts/android/files/AndroidManifest.xml \
-            scripts/android/files/gradlew \
-            scripts/android/files/gradle/wrapper/gradle-wrapper.jar \
-            scripts/android/files/gradle/wrapper/gradle-wrapper.properties \
-            scripts/android/files/java/org/ddnet/client/ClientActivity.java \
-            scripts/android/files/java/org/ddnet/client/ServerService.java; do
+          for f in CMakeLists.txt src/game/version.h scripts/android/cmake_android.sh; do
             if [ ! -f "$f" ]; then echo "MISSING: $f"; missing=1; fi
           done
-          if [ ! -d scripts/android/files/res ]; then echo "MISSING dir: scripts/android/files/res"; missing=1; fi
           if [ ! -d data ]; then echo "MISSING dir: data"; missing=1; fi
+          if [ "$LEGACY" = "1" ]; then
+            for f in \
+              scripts/android/files/build.sh \
+              scripts/android/files/build.gradle \
+              scripts/android/files/gradle-wrapper.jar \
+              scripts/android/files/gradle-wrapper.properties \
+              scripts/android/files/gradle.properties \
+              scripts/android/files/local.properties \
+              scripts/android/files/proguard-rules.pro \
+              scripts/android/files/settings.gradle \
+              scripts/android/files/AndroidManifest.xml \
+              scripts/android/files/java/tw/DDNet/NativeMain.java; do
+              if [ ! -f "$f" ]; then echo "MISSING: $f"; missing=1; fi
+            done
+          else
+            for f in \
+              scripts/android/download_android_sdk.sh \
+              scripts/android/generate_asset_integrity_index.py \
+              scripts/compile_libs/_build_common.sh \
+              scripts/android/files/build.sh \
+              scripts/android/files/build.gradle \
+              scripts/android/files/settings.gradle \
+              scripts/android/files/gradle.properties \
+              scripts/android/files/proguard-rules.pro \
+              scripts/android/files/AndroidManifest.xml \
+              scripts/android/files/gradlew \
+              scripts/android/files/gradle/wrapper/gradle-wrapper.jar \
+              scripts/android/files/gradle/wrapper/gradle-wrapper.properties \
+              scripts/android/files/java/org/ddnet/client/ClientActivity.java \
+              scripts/android/files/java/org/ddnet/client/ServerService.java; do
+              if [ ! -f "$f" ]; then echo "MISSING: $f"; missing=1; fi
+            done
+          fi
+          if [ ! -d scripts/android/files/res ]; then echo "MISSING dir: scripts/android/files/res"; missing=1; fi
           if [ "$missing" = 1 ]; then
             echo "::error::в сурсе нет файлов, нужных для android-сборки (см. MISSING выше)"
             exit 1
           fi
-          echo "android-проект: все файлы на месте"
+          echo "android-проект: все файлы на месте (LEGACY=$LEGACY)"
 
-      - name: Patch build.sh (mkdir -p перед mv — баг com.* пакетов)
+      - name: Patch android project (пакет com.altynekst.tapk)
         run: |
-          if grep -q 'mv src/main/java/org/ddnet/client' scripts/android/files/build.sh; then
-            if grep -q 'mkdir -p "src/main/java/$(dirname' scripts/android/files/build.sh; then
-              echo "build.sh: mv-патч уже стоит"
-            else
-              sed -i 's|mv src/main/java/org/ddnet/client src/main/java/"${APK_PACKAGE_FOLDER}"|mkdir -p "src/main/java/$(dirname "${APK_PACKAGE_FOLDER}")" \&\& mv src/main/java/org/ddnet/client src/main/java/"${APK_PACKAGE_FOLDER}"|' scripts/android/files/build.sh
-              if grep -q 'mkdir -p "src/main/java/$(dirname' scripts/android/files/build.sh; then
-                echo "build.sh: mv-патч применён (mkdir -p && mv)"
-              else
-                echo "::warning::mv-патч не применился: строка mv отличается от эталона DDNet 19.8.2"
-              fi
-            fi
+          if [ "$LEGACY" = "1" ]; then
+            echo "LEGACY: патчу build.sh/cmake_android.sh/build.gradle/local.properties под 17.x"
+            printf '%s' 'IyAtKi0gY29kaW5nOiB1dGYtOCAtKi0KIiIi0J/QsNGC0YfQuCBhbmRyb2lkLdC/0YDQvtC10LrRgtCwIERETmV0IDE2LngvMTcueCAoTEVHQUNZIGxheW91dCkg0L/QvtC0INC/0LDQutC10YIgY29tLmFsdHluZWtzdC50YXBrLgrQkiBDSSDRgNCw0LfQstC+0YDQsNGH0LjQstCw0LXRgtGB0Y8g0LjQtyBiYXNlNjQg0Lgg0LfQsNC/0YPRgdC60LDQtdGC0YHRjyBweXRob24zLiIiIgppbXBvcnQgaW8KCmRlZiBwYXRjaChwYXRoLCBwYWlycyk6CiAgICB0cnk6CiAgICAgICAgcyA9IGlvLm9wZW4ocGF0aCwgZW5jb2Rpbmc9InV0Zi04IikucmVhZCgpCiAgICBleGNlcHQgT1NFcnJvciBhcyBlOgogICAgICAgIHByaW50KCI6OmVycm9yOjrQvdC1INC+0YLQutGA0YvRgtGMICVzOiAlcyIgJSAocGF0aCwgZSkpCiAgICAgICAgcmFpc2UgU3lzdGVtRXhpdCgxKQogICAgZm9yIG9sZCwgbmV3LCBsYWJlbCBpbiBwYWlyczoKICAgICAgICBpZiBvbGQgaW4gczoKICAgICAgICAgICAgcyA9IHMucmVwbGFjZShvbGQsIG5ldykKICAgICAgICAgICAgcHJpbnQoItC/0LDRgtGHICVzOiAlcyDigJQgb2siICUgKHBhdGgsIGxhYmVsKSkKICAgICAgICBlbHNlOgogICAgICAgICAgICBwcmludCgiOjp3YXJuaW5nOjrQsiAlcyDQvdC1INC90LDQudC00LXQvdC+ICglcyk6ICVyIiAlIChwYXRoLCBsYWJlbCwgb2xkWzo3MF0pKQogICAgaW8ub3BlbihwYXRoLCAidyIsIGVuY29kaW5nPSJ1dGYtOCIpLndyaXRlKHMpCgpwYXRjaCgic2NyaXB0cy9hbmRyb2lkL2ZpbGVzL2J1aWxkLnNoIiwgWwogICAgKCdfUkVQTEFDRV9QQUNLQUdFX05BTUVfU1RSPSJ0dy4kezIsLH0iJywKICAgICAnX1JFUExBQ0VfUEFDS0FHRV9OQU1FX1NUUj0iY29tLmFsdHluZWtzdC50YXBrIicsCiAgICAgItC/0LDQutC10YIgLT4gY29tLmFsdHluZWtzdC50YXBrIiksCiAgICAoJ212IHNyYy9tYWluL2phdmEvdHcvREROZXQgc3JjL21haW4vamF2YS90dy8iJHsyfSInLAogICAgICdta2RpciAtcCBzcmMvbWFpbi9qYXZhL2NvbS9hbHR5bmVrc3QgJiYgbXYgc3JjL21haW4vamF2YS90dy9ERE5ldCBzcmMvbWFpbi9qYXZhL2NvbS9hbHR5bmVrc3QvdGFwaycsCiAgICAgIm12INGBIG1rZGlyIC1wIChjb20vYWx0eW5la3N0L3RhcGspIiksCiAgICAoJ3NyYy9tYWluL2phdmEvdHcvIiR7Mn0iL05hdGl2ZU1haW4uamF2YScsCiAgICAgJ3NyYy9tYWluL2phdmEvY29tL2FsdHluZWtzdC90YXBrL05hdGl2ZU1haW4uamF2YScsCiAgICAgItC/0YPRgtGMIE5hdGl2ZU1haW4uamF2YSIpLAogICAgKCdzZWQgLWkgInMvXFwiREROZXRcXCIvXFwiJHsyfVxcIi9nIiBzcmMvbWFpbi9BbmRyb2lkTWFuaWZlc3QueG1sJywKICAgICAndHJ1ZSAjIGxpYl9uYW1lINC+0YHRgtCw0ZHRgtGB0Y8gREROZXQg4oCUINC90LDRgtC40LLQvdCw0Y8g0LvQuNCx0LAgbGliREROZXQuc28nLAogICAgICLQvdC1INC70L7QvNCw0YLRjCBhbmRyb2lkOnZhbHVlPWxpYl9uYW1lIiksCl0pCnBhdGNoKCJzY3JpcHRzL2FuZHJvaWQvY21ha2VfYW5kcm9pZC5zaCIsIFsKICAgICgiY21ha2UgLS1idWlsZCAuIC0tdGFyZ2V0IERETmV0IiwKICAgICAiY21ha2UgLS1idWlsZCAuIC0tdGFyZ2V0IGdhbWUtY2xpZW50IiwKICAgICAi0YbQtdC70YwgZ2FtZS1jbGllbnQgKNCyIDE3Lngg0L/QtdGA0LXQuNC80LXQvdC+0LLQsNC90LAg0LjQtyBERE5ldCkiKSwKICAgICgiLURBTkRST0lEX0FSTV9ORU9OPVRSVUUgXFwiLAogICAgICItREFORFJPSURfQVJNX05FT049VFJVRSBcXFxuXHRcdFx0LURDTUFLRV9SVVNUX0NPTVBJTEVSX1RBUkdFVD1hYXJjaDY0LWxpbnV4LWFuZHJvaWQgXFwiLAogICAgICJydXN0LdC60YDQvtGB0YEgYWFyY2g2NC1saW51eC1hbmRyb2lkIiksCl0pCnBhdGNoKCJzY3JpcHRzL2FuZHJvaWQvZmlsZXMvYnVpbGQuZ3JhZGxlIiwgWwogICAgKCJhcHBseSBwbHVnaW46ICdrb3RsaW4tYW5kcm9pZCciLAogICAgICIvLyBrb3RsaW4g0L7RgtC60LvRjtGH0ZHQvSAo0LIgMjAyNiAnKycg0YLRj9C90LXRgiBLR1AgMi54LCDQvdC10YHQvtCy0LzQtdGB0YLQuNC80YvQuSDRgSBBR1AgNy4yLjEpIiwKICAgICAia290bGluIHBsdWdpbiBvZmYiKSwKICAgICgnY2xhc3NwYXRoICJvcmcuamV0YnJhaW5zLmtvdGxpbjprb3RsaW4tZ3JhZGxlLXBsdWdpbjoka290bGluX3ZlcnNpb24iJywKICAgICAiLy8ga290bGluIGNsYXNzcGF0aCBvZmYiLAogICAgICJrb3RsaW4gY2xhc3NwYXRoIG9mZiIpLAogICAgKCJleHQua290bGluX3ZlcnNpb24gPSAnKyciLAogICAgICIiLAogICAgICJrb3RsaW4gZXh0IG9mZiIpLAogICAgKCdpbXBsZW1lbnRhdGlvbiAib3JnLmpldGJyYWlucy5rb3RsaW46a290bGluLXN0ZGxpYi1qZGs3OiRrb3RsaW5fdmVyc2lvbiInLAogICAgICIvLyBrb3RsaW4gc3RkbGliIG9mZiIsCiAgICAgImtvdGxpbiBzdGRsaWIgb2ZmIiksCl0pCnBhdGNoKCJzY3JpcHRzL2FuZHJvaWQvZmlsZXMvbG9jYWwucHJvcGVydGllcyIsIFsKICAgICgnc2RrLmRpcj0iVFdfSE9NRV9ESVIvQW5kcm9pZC9TZGsiJywKICAgICAic2RrLmRpcj0vaG9tZS9ydW5uZXIvQW5kcm9pZC9TZGsiLAogICAgICJzZGsuZGlyINCw0LHRgdC+0LvRjtGC0L3Ri9C5INCx0LXQtyDQutCw0LLRi9GH0LXQuiIpLApdKQpwcmludCgiTEVHQUNZLdC/0LDRgtGH0Lgg0L/RgNC40LzQtdC90LXQvdGLIikK' | base64 -d > /tmp/patch_legacy.py
+            python3 /tmp/patch_legacy.py
           else
-            echo "::warning::mv в build.sh не найден — форк, возможно, уже чинил это"
+            if grep -q 'mv src/main/java/org/ddnet/client' scripts/android/files/build.sh; then
+              if grep -q 'mkdir -p "src/main/java/$(dirname' scripts/android/files/build.sh; then
+                echo "build.sh: mv-патч уже стоит"
+              else
+                sed -i 's|mv src/main/java/org/ddnet/client src/main/java/"${APK_PACKAGE_FOLDER}"|mkdir -p "src/main/java/$(dirname "${APK_PACKAGE_FOLDER}")" \&\& mv src/main/java/org/ddnet/client src/main/java/"${APK_PACKAGE_FOLDER}"|' scripts/android/files/build.sh
+                if grep -q 'mkdir -p "src/main/java/$(dirname' scripts/android/files/build.sh; then
+                  echo "build.sh: mv-патч применён (mkdir -p && mv)"
+                else
+                  echo "::warning::mv-патч не применился: строка mv отличается от эталона DDNet 19.8.2"
+                fi
+              fi
+            else
+              echo "::warning::mv в build.sh не найден — форк, возможно, уже чинил это"
+            fi
           fi
 
       - name: Icon stub (other/icons/DDNet_256x256x32.png)
@@ -217,37 +254,61 @@ jobs:
       - name: Prepare Linux
         run: |
           sudo apt-get update -y -o Acquire::Retries=5
-          sudo apt-get install -y -o Acquire::Retries=5 ninja-build openjdk-21-jdk openssl
+          sudo apt-get install -y -o Acquire::Retries=5 ninja-build openjdk-21-jdk openssl unzip
           curl -fL --retry 5 --retry-delay 5 --retry-all-errors --connect-timeout 30 -o cmake.tar.gz https://github.com/Kitware/CMake/releases/download/v3.22.1/cmake-3.22.1-Linux-x86_64.tar.gz
           mkdir -p /home/runner/cmake
           tar --strip-components 1 -C /home/runner/cmake -xf cmake.tar.gz
+          find scripts -name '*.sh' -exec chmod +x {} +
           rustup install 1.92.0 --profile minimal
           rustup default 1.92.0
           export CARGO_NET_RETRY=10
           export CARGO_HTTP_TIMEOUT=120
-          cargo install cargo-ndk
           rustup target add aarch64-linux-android
-          find scripts -name '*.sh' -exec chmod +x {} +
-          chmod +x scripts/android/files/gradlew
-          export HOST_OS=linux
-          sdk_ok=0
-          for i in 1 2 3; do
-            if bash scripts/android/download_android_sdk.sh /home/runner; then sdk_ok=1; break; fi
-            echo "попытка $i не удалась — чищу /home/runner/Android/Sdk и повторяю через 20 сек"
-            rm -rf /home/runner/Android/Sdk
-            sleep 20
-          done
-          if [ "$sdk_ok" != 1 ]; then
-            echo "::error::download_android_sdk.sh не отработал за 3 попытки"
-            exit 1
+          if [ "$LEGACY" = "1" ]; then
+            echo "LEGACY: ставлю SDK сам (в 17.x нет download_android_sdk.sh): cmdline-tools + platform-30 + build-tools 30.0.3 + NDK r27c"
+            mkdir -p /home/runner/Android/Sdk/cmdline-tools /home/runner/Android/Sdk/ndk
+            curl -fL --retry 5 --retry-delay 5 --retry-all-errors --connect-timeout 30 -o /tmp/clt.zip https://dl.google.com/android/repository/commandlinetools-linux-13114758_latest.zip
+            rm -rf /tmp/clt_x && mkdir -p /tmp/clt_x && unzip -q /tmp/clt.zip -d /tmp/clt_x
+            rm -rf /home/runner/Android/Sdk/cmdline-tools/latest
+            mv /tmp/clt_x/cmdline-tools /home/runner/Android/Sdk/cmdline-tools/latest
+            yes 2>/dev/null | /home/runner/Android/Sdk/cmdline-tools/latest/bin/sdkmanager --licenses >/dev/null || true
+            /home/runner/Android/Sdk/cmdline-tools/latest/bin/sdkmanager --install "platform-tools" "platforms;android-30" "build-tools;30.0.3" >/tmp/sdkmgr.log 2>&1 || { tail -30 /tmp/sdkmgr.log; echo "::error::sdkmanager не установил компоненты"; exit 1; }
+            curl -fL --retry 5 --retry-delay 5 --retry-all-errors --connect-timeout 30 -o /tmp/ndk.zip https://dl.google.com/android/repository/android-ndk-r27c-linux.zip
+            rm -rf /tmp/ndk_x && mkdir -p /tmp/ndk_x && unzip -q /tmp/ndk.zip -d /tmp/ndk_x
+            rm -rf /home/runner/Android/Sdk/ndk/27.2.12479018
+            mv /tmp/ndk_x/android-ndk-r27c /home/runner/Android/Sdk/ndk/27.2.12479018
+            echo "NDK: $(ls /home/runner/Android/Sdk/ndk)"
+            echo "SDK: $(ls /home/runner/Android/Sdk/platforms /home/runner/Android/Sdk/build-tools)"
+          else
+            chmod +x scripts/android/files/gradlew || true
+            export HOST_OS=linux
+            cargo install cargo-ndk
+            sdk_ok=0
+            for i in 1 2 3; do
+              if bash scripts/android/download_android_sdk.sh /home/runner; then sdk_ok=1; break; fi
+              echo "попытка $i не удалась — чищу /home/runner/Android/Sdk и повторяю через 20 сек"
+              rm -rf /home/runner/Android/Sdk
+              sleep 20
+            done
+            if [ "$sdk_ok" != 1 ]; then
+              echo "::error::download_android_sdk.sh не отработал за 3 попытки"
+              exit 1
+            fi
+            echo "NDK: $(ls /home/runner/Android/Sdk/ndk)"
           fi
-          ls /home/runner/Android/Sdk/ndk
 
       - name: Install Vulkan SDK
         uses: humbletim/install-vulkan-sdk@v1.2
         with:
           version: 1.3.296.0
           cache: true
+
+      - name: Install JDK 11 (gradle 7.4.2 + AGP 7.2.1 в LEGACY)
+        if: env.LEGACY == '1'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '11'
 
       - name: Build Android app (arm64-v8a only)
         run: |
@@ -256,21 +317,12 @@ jobs:
           export TW_KEY_PW="$(openssl rand -base64 32)"
           keytool -genkey -v -keystore "$TW_KEY_NAME" -keyalg RSA -keysize 2048 -validity 10000 -alias "$TW_KEY_ALIAS" -storepass "$TW_KEY_PW" -dname "CN=T-apk, OU=T-apk, O=T-apk"
           export ANDROID_HOME="/home/runner/Android/Sdk"
-          unset ANDROID_SDK_ROOT
-          if [ -n "${JAVA_HOME_21_X64:-}" ]; then export JAVA_HOME="$JAVA_HOME_21_X64"; fi
-          export PATH=/home/runner/cmake/bin:$PATH
-          export ANDROID_NDK_HOME="/home/runner/Android/Sdk/ndk/29.0.14206865"
-          if [ ! -f "$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" ]; then
-            NDK_ALT=$(ls -d /home/runner/Android/Sdk/ndk/*/ 2>/dev/null | head -1 || true)
-            if [ -n "$NDK_ALT" ] && [ -f "${NDK_ALT}build/cmake/android.toolchain.cmake" ]; then
-              export ANDROID_NDK_HOME="${NDK_ALT%/}"
-            else
-              echo "::error::NDK не найден в /home/runner/Android/Sdk/ndk — download_android_sdk.sh не отработал?"
-              exit 1
-            fi
+          export ANDROID_SDK_ROOT="/home/runner/Android/Sdk"
+          if [ -n "${VULKAN_SDK:-}" ]; then export PATH="$VULKAN_SDK/bin:$PATH"; fi
+          if ! command -v glslangValidator >/dev/null 2>&1 && ! command -v glslang >/dev/null 2>&1; then
+            echo "::error::glslangValidator не найден — без него не собрать Vulkan-шейдеры"
+            exit 1
           fi
-          export ANDROID_TOOLCHAIN_ROOT="$ANDROID_NDK_HOME"
-          echo "ANDROID_NDK_HOME=$ANDROID_NDK_HOME | JAVA_HOME=${JAVA_HOME:-default}"
           VN=$(grep -m1 '#define GAME_RELEASE_VERSION_INTERNAL' src/game/version.h | awk '{print $3}' | tr -d '"' | tr '_' '.' || true)
           if [ -z "$VN" ]; then VN=$(grep -m1 -E '^#define[[:space:]]+GAME_RELEASE_VERSION[[:space:]]+"' src/game/version.h | sed -E 's/.*"([^"]*)".*/\1/' | tr '_' '.' || true); fi
           if [ -z "$VN" ]; then VN="1.0"; fi
@@ -278,17 +330,56 @@ jobs:
           VC=$(grep -m1 '#define DDNET_VERSION_NUMBER' src/game/version.h | awk '{print $3}' || true)
           if [ -z "$VC" ]; then VC="${GITHUB_RUN_NUMBER}"; fi
           export TW_VERSION_CODE="$VC"
-          GAME=$(grep -m1 '#define GAME_NAME' src/game/version.h | sed -n 's/^#define[[:space:]]*GAME_NAME[[:space:]]*"\([^"]*\)".*/\1/p' || true)
-          if [ -z "$GAME" ]; then GAME=$(grep -im1 '^[[:space:]]*project[[:space:]]*(' CMakeLists.txt | sed 's/^[^(]*project[[:space:]]*(//; s/[^A-Za-z0-9_-].*$//' || true); fi
-          if [ -z "$GAME" ]; then GAME=DDNet; fi
-          echo "GAME_NAME=$GAME | PACKAGE=com.altynekst.tapk | VERSION_NAME=$VN | VERSION_CODE=$VC"
-          bash scripts/android/cmake_android.sh arm64 "$GAME" com.altynekst.tapk Release build-android-release
           mkdir -p artifacts
-          APK=$(find build-android-release -maxdepth 2 -name '*.apk' | head -1)
-          if [ -z "$APK" ]; then
-            echo "::error::APK не найден в build-android-release"
-            find build-android-release -name '*.apk' || true
-            exit 1
+          if [ "$LEGACY" = "1" ]; then
+            export PATH=/home/runner/cmake/bin:$PATH
+            export ANDROID_NDK_HOME="/home/runner/Android/Sdk/ndk/27.2.12479018"
+            if [ ! -f "$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" ]; then
+              echo "::error::NDK r27c не найден в $ANDROID_NDK_HOME"
+              exit 1
+            fi
+            export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang"
+            echo "LEGACY-сборка: DDNet ${DDNET_VERSION:-17.4} | APK-имя T-apk | пакет com.altynekst.tapk (патч build.sh) | VN=$VN | VC=$VC"
+            echo "JAVA: $(java -version 2>&1 | head -1)"
+            bash scripts/android/cmake_android.sh arm64 "T-apk" Release
+            if [ ! -f build_android/lib/arm64-v8a/libDDNet.so ]; then
+              echo "::error::libDDNet.so не собрался/не скопировался"
+              find build_android -maxdepth 3 -name '*.so' | head -20 || true
+              exit 1
+            fi
+            APK=$(find build_android -maxdepth 1 -name '*.apk' | head -1)
+            if [ -z "$APK" ]; then
+              echo "::error::APK не найден в build_android"
+              find build_android -name '*.apk' || true
+              exit 1
+            fi
+          else
+            unset ANDROID_SDK_ROOT
+            if [ -n "${JAVA_HOME_21_X64:-}" ]; then export JAVA_HOME="$JAVA_HOME_21_X64"; fi
+            export PATH=/home/runner/cmake/bin:$PATH
+            export ANDROID_NDK_HOME="/home/runner/Android/Sdk/ndk/29.0.14206865"
+            if [ ! -f "$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" ]; then
+              NDK_ALT=$(ls -d /home/runner/Android/Sdk/ndk/*/ 2>/dev/null | head -1 || true)
+              if [ -n "$NDK_ALT" ] && [ -f "${NDK_ALT}build/cmake/android.toolchain.cmake" ]; then
+                export ANDROID_NDK_HOME="${NDK_ALT%/}"
+              else
+                echo "::error::NDK не найден в /home/runner/Android/Sdk/ndk — download_android_sdk.sh не отработал?"
+                exit 1
+              fi
+            fi
+            export ANDROID_TOOLCHAIN_ROOT="$ANDROID_NDK_HOME"
+            echo "ANDROID_NDK_HOME=$ANDROID_NDK_HOME | JAVA_HOME=${JAVA_HOME:-default}"
+            GAME=$(grep -m1 '#define GAME_NAME' src/game/version.h | sed -n 's/^#define[[:space:]]*GAME_NAME[[:space:]]*"\([^"]*\)".*/\1/p' || true)
+            if [ -z "$GAME" ]; then GAME=$(grep -im1 '^[[:space:]]*project[[:space:]]*(' CMakeLists.txt | sed 's/^[^(]*project[[:space:]]*(//; s/[^A-Za-z0-9_-].*$//' || true); fi
+            if [ -z "$GAME" ]; then GAME=DDNet; fi
+            echo "GAME_NAME=$GAME | PACKAGE=com.altynekst.tapk | VERSION_NAME=$VN | VERSION_CODE=$VC"
+            bash scripts/android/cmake_android.sh arm64 "$GAME" com.altynekst.tapk Release build-android-release
+            APK=$(find build-android-release -maxdepth 2 -name '*.apk' | head -1)
+            if [ -z "$APK" ]; then
+              echo "::error::APK не найден в build-android-release"
+              find build-android-release -name '*.apk' || true
+              exit 1
+            fi
           fi
           echo "APK: $APK"
           cp "$APK" artifacts/T-apk.apk
