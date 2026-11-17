@@ -30,8 +30,8 @@ jobs:
             exit 0
           fi
           AUTH="Authorization: token $GITHUB_TOKEN"
-          BASE=$(grep -m1 -E '^#define[[:space:]]+GAME_RELEASE_VERSION[[:space:]]' src/game/version.h | sed -E 's/.*"([^"]*)".*/\1/' | tr '_' '.' || true)
-          if [ -z "$BASE" ]; then BASE=$(grep -m1 '#define GAME_RELEASE_VERSION_INTERNAL' src/game/version.h | awk '{print $3}' | tr -d '"' | tr '_' '.' || true); fi
+          BASE=$(grep -m1 '#define GAME_RELEASE_VERSION_INTERNAL' src/game/version.h | awk '{print $3}' | tr -d '"' | tr '_' '.' || true)
+          if [ -z "$BASE" ]; then BASE=$(grep -m1 -E '^#define[[:space:]]+GAME_RELEASE_VERSION[[:space:]]+"' src/game/version.h | sed -E 's/.*"([^"]*)".*/\1/' | tr '_' '.' || true); fi
           if [ -z "$BASE" ]; then BASE="19.8.2"; fi
           TAG="$BASE"
           code=$(curl -s -o /dev/null -w '%{http_code}' -H "$AUTH" "https://api.github.com/repos/ddnet/ddnet/contents/ddnet-libs?ref=$TAG" || echo 000)
@@ -51,7 +51,7 @@ jobs:
           shopt -s nullglob
           for d in /tmp/ddnet_full/* /tmp/ddnet_full/.git*; do
             b=$(basename "$d")
-            if [ "$b" != "src" ]; then cp -a "$d" .; fi
+            if [ "$b" != "src" ] && [ "$b" != "ddnet-libs" ] && [ "$b" != ".github" ]; then cp -a "$d" .; fi
           done
           ROOT="$PWD"
           (cd /tmp/ddnet_full/src && find . -mindepth 1 -print0 | while IFS= read -r -d '' p; do
@@ -64,39 +64,75 @@ jobs:
           done)
           echo "Ассемблировано, файлов в корне репо: $(find . -type f | wc -l)"
 
-      - name: Materialize ddnet-libs (динамический пин под версию DDNet)
+      - name: Materialize ddnet-libs (пин под версию DDNet, тарболл без git)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           AUTH="Authorization: token $GITHUB_TOKEN"
-          BASE=$(grep -m1 -E '^#define[[:space:]]+GAME_RELEASE_VERSION[[:space:]]' src/game/version.h | sed -E 's/.*"([^"]*)".*/\1/' | tr '_' '.' || true)
-          if [ -z "$BASE" ]; then BASE=$(grep -m1 '#define GAME_RELEASE_VERSION_INTERNAL' src/game/version.h | awk '{print $3}' | tr -d '"' | tr '_' '.' || true); fi
+          BASE=$(grep -m1 '#define GAME_RELEASE_VERSION_INTERNAL' src/game/version.h | awk '{print $3}' | tr -d '"' | tr '_' '.' || true)
+          if [ -z "$BASE" ]; then BASE=$(grep -m1 -E '^#define[[:space:]]+GAME_RELEASE_VERSION[[:space:]]+"' src/game/version.h | sed -E 's/.*"([^"]*)".*/\1/' | tr '_' '.' || true); fi
+          if [ -z "$BASE" ]; then BASE="19.8.2"; fi
           TAG="$BASE"
-          if [ -z "$TAG" ]; then TAG="19.8.2"; fi
-          LIBS_SHA=$(curl -s -H "$AUTH" "https://api.github.com/repos/ddnet/ddnet/contents/ddnet-libs?ref=$TAG" | python3 -c "import sys,json; print(json.load(sys.stdin).get('sha',''))" || true)
+          LIBS_SHA=$(git ls-tree HEAD ddnet-libs 2>/dev/null | awk '{print $3}' || true)
+          if [ -n "$LIBS_SHA" ]; then echo "пин ddnet-libs из gitlink репо: $LIBS_SHA"; fi
+          if [ -z "$LIBS_SHA" ]; then
+            LIBS_SHA=$(curl -s -H "$AUTH" "https://api.github.com/repos/ddnet/ddnet/contents/ddnet-libs?ref=$TAG" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('sha','') if isinstance(d,dict) else '')" 2>/dev/null || true)
+          fi
           if [ -z "$LIBS_SHA" ]; then
             case "$BASE" in
               *.*.*) TAG=$(echo "$BASE" | cut -d. -f1-2) ;;
               *) TAG="19.8.2" ;;
             esac
-            LIBS_SHA=$(curl -s -H "$AUTH" "https://api.github.com/repos/ddnet/ddnet/contents/ddnet-libs?ref=$TAG" | python3 -c "import sys,json; print(json.load(sys.stdin).get('sha',''))" || true)
+            LIBS_SHA=$(curl -s -H "$AUTH" "https://api.github.com/repos/ddnet/ddnet/contents/ddnet-libs?ref=$TAG" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('sha','') if isinstance(d,dict) else '')" 2>/dev/null || true)
           fi
           if [ -z "$LIBS_SHA" ]; then
             TAG="19.8.2"
             LIBS_SHA="c0e6703fbcdbe03df2f26875427ec3951ce4ec21"
           fi
           echo "ddnet-libs пин: $LIBS_SHA (DDNet $TAG)"
-          if [ -f .gitmodules ]; then
-            git submodule update --init --recursive || echo "::warning::git submodule update не удался — будет fallback-клон"
-          fi
-          if [ ! -f ddnet-libs/CMakeLists.txt ]; then
-            echo "::warning::ddnet-libs пуст — клонирую https://github.com/ddnet/ddnet-libs"
+          ok=0
+          for i in 1 2 3; do
+            rm -rf /tmp/libs.tgz /tmp/libs_x ddnet-libs
+            code=$(curl -L --retry 5 --retry-delay 5 --retry-all-errors --connect-timeout 30 -s -o /tmp/libs.tgz -w '%{http_code}' "https://codeload.github.com/ddnet/ddnet-libs/tar.gz/$LIBS_SHA" || echo 000)
+            if [ "$code" = "200" ] && [ -s /tmp/libs.tgz ]; then
+              mkdir -p /tmp/libs_x
+              if tar --strip-components 1 -C /tmp/libs_x -xf /tmp/libs.tgz 2>/tmp/libs_err; then
+                mkdir -p ddnet-libs
+                cp -a /tmp/libs_x/. ddnet-libs/
+                rm -rf /tmp/libs_x
+                ok=1
+                echo "ddnet-libs: тарболл по пину скачан и распакован"
+                break
+              fi
+              echo "попытка $i: тарболл битый: $(tail -c 200 /tmp/libs_err)"
+              sleep 10
+            else
+              echo "попытка $i: codeload http=$code — повтор через 15 сек"
+              sleep 15
+            fi
+          done
+          if [ "$ok" != 1 ]; then
+            echo "::warning::codeload-тарболл не скачался — пробую git clone"
+            git config --global http.version HTTP/1.1 || true
             rm -rf ddnet-libs
-            git clone --recursive https://github.com/ddnet/ddnet-libs.git ddnet-libs
-            (cd ddnet-libs && git checkout -q "$LIBS_SHA" && git submodule update --init --recursive) || echo "оставляю ddnet-libs на HEAD"
-          else
-            echo "ddnet-libs уже с файлами, ок"
+            git clone --depth 1 https://github.com/ddnet/ddnet-libs.git ddnet-libs || { sleep 10; rm -rf ddnet-libs; git clone https://github.com/ddnet/ddnet-libs.git ddnet-libs; } || echo "::warning::git clone не удался"
+            if [ -d ddnet-libs/.git ]; then
+              (cd ddnet-libs && git cat-file -e "$LIBS_SHA" 2>/dev/null && git checkout -q "$LIBS_SHA") || (cd ddnet-libs && git fetch --depth 1 origin "$LIBS_SHA" && git checkout -q FETCH_HEAD) || echo "::warning::пин недоступен — ddnet-libs на HEAD"
+            fi
           fi
+          if [ ! -f ddnet-libs/curl/android/libarm64/libcurl.a ]; then
+            echo "::warning::последняя попытка: shallow clone HEAD"
+            rm -rf ddnet-libs
+            git clone --depth 1 https://github.com/ddnet/ddnet-libs.git ddnet-libs || echo "::warning::shallow clone тоже не удался"
+          fi
+          echo "=== диагностика ddnet-libs:"
+          git -C ddnet-libs log --oneline -1 2>/dev/null || true
+          ls ddnet-libs 2>/dev/null | head -20
+          if [ ! -f ddnet-libs/curl/android/libarm64/libcurl.a ]; then
+            echo "::error::ddnet-libs не материализовался ни одним способом (пин $LIBS_SHA)"
+            exit 1
+          fi
+          echo "ddnet-libs готов (пин $LIBS_SHA)"
 
       - name: Check ddnet-libs (arm64 prebuilt libs)
         run: |
@@ -112,8 +148,7 @@ jobs:
             ddnet-libs/opus/android/libarm64/libopusfile.a \
             ddnet-libs/sdl/android/libarm64/libSDL2.a \
             ddnet-libs/sqlite3/android/libarm64/libsqlite3.a \
-            ddnet-libs/wavpack/android/libarm64/libwavpack.a \
-            ddnet-libs/CMakeLists.txt; do
+            ddnet-libs/wavpack/android/libarm64/libwavpack.a; do
             if [ ! -f "$f" ]; then echo "MISSING: $f"; missing=1; fi
           done
           if [ ! -d ddnet-libs/sdl/java/org ]; then echo "MISSING dir: ddnet-libs/sdl/java/org"; missing=1; fi
@@ -186,6 +221,7 @@ jobs:
           curl -fL --retry 5 --retry-delay 5 --retry-all-errors --connect-timeout 30 -o cmake.tar.gz https://github.com/Kitware/CMake/releases/download/v3.22.1/cmake-3.22.1-Linux-x86_64.tar.gz
           mkdir -p /home/runner/cmake
           tar --strip-components 1 -C /home/runner/cmake -xf cmake.tar.gz
+          rustup install 1.92.0 --profile minimal
           rustup default 1.92.0
           export CARGO_NET_RETRY=10
           export CARGO_HTTP_TIMEOUT=120
@@ -193,7 +229,19 @@ jobs:
           rustup target add aarch64-linux-android
           find scripts -name '*.sh' -exec chmod +x {} +
           chmod +x scripts/android/files/gradlew
-          bash scripts/android/download_android_sdk.sh /home/runner || { sleep 15; bash scripts/android/download_android_sdk.sh /home/runner; }
+          export HOST_OS=linux
+          sdk_ok=0
+          for i in 1 2 3; do
+            if bash scripts/android/download_android_sdk.sh /home/runner; then sdk_ok=1; break; fi
+            echo "попытка $i не удалась — чищу /home/runner/Android/Sdk и повторяю через 20 сек"
+            rm -rf /home/runner/Android/Sdk
+            sleep 20
+          done
+          if [ "$sdk_ok" != 1 ]; then
+            echo "::error::download_android_sdk.sh не отработал за 3 попытки"
+            exit 1
+          fi
+          ls /home/runner/Android/Sdk/ndk
 
       - name: Install Vulkan SDK
         uses: humbletim/install-vulkan-sdk@v1.2
@@ -209,9 +257,22 @@ jobs:
           keytool -genkey -v -keystore "$TW_KEY_NAME" -keyalg RSA -keysize 2048 -validity 10000 -alias "$TW_KEY_ALIAS" -storepass "$TW_KEY_PW" -dname "CN=T-apk, OU=T-apk, O=T-apk"
           export ANDROID_HOME="/home/runner/Android/Sdk"
           unset ANDROID_SDK_ROOT
+          if [ -n "${JAVA_HOME_21_X64:-}" ]; then export JAVA_HOME="$JAVA_HOME_21_X64"; fi
           export PATH=/home/runner/cmake/bin:$PATH
-          VN=$(grep -m1 -E '^#define[[:space:]]+GAME_RELEASE_VERSION[[:space:]]' src/game/version.h | sed -E 's/.*"([^"]*)".*/\1/' | tr '_' '.' || true)
-          if [ -z "$VN" ]; then VN=$(grep -m1 '#define GAME_RELEASE_VERSION_INTERNAL' src/game/version.h | awk '{print $3}' | tr -d '"' | tr '_' '.' || true); fi
+          export ANDROID_NDK_HOME="/home/runner/Android/Sdk/ndk/29.0.14206865"
+          if [ ! -f "$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" ]; then
+            NDK_ALT=$(ls -d /home/runner/Android/Sdk/ndk/*/ 2>/dev/null | head -1 || true)
+            if [ -n "$NDK_ALT" ] && [ -f "${NDK_ALT}build/cmake/android.toolchain.cmake" ]; then
+              export ANDROID_NDK_HOME="${NDK_ALT%/}"
+            else
+              echo "::error::NDK не найден в /home/runner/Android/Sdk/ndk — download_android_sdk.sh не отработал?"
+              exit 1
+            fi
+          fi
+          export ANDROID_TOOLCHAIN_ROOT="$ANDROID_NDK_HOME"
+          echo "ANDROID_NDK_HOME=$ANDROID_NDK_HOME | JAVA_HOME=${JAVA_HOME:-default}"
+          VN=$(grep -m1 '#define GAME_RELEASE_VERSION_INTERNAL' src/game/version.h | awk '{print $3}' | tr -d '"' | tr '_' '.' || true)
+          if [ -z "$VN" ]; then VN=$(grep -m1 -E '^#define[[:space:]]+GAME_RELEASE_VERSION[[:space:]]+"' src/game/version.h | sed -E 's/.*"([^"]*)".*/\1/' | tr '_' '.' || true); fi
           if [ -z "$VN" ]; then VN="1.0"; fi
           export TW_VERSION_NAME="$VN"
           VC=$(grep -m1 '#define DDNET_VERSION_NUMBER' src/game/version.h | awk '{print $3}' || true)
