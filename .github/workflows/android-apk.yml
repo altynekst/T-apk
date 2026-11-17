@@ -467,7 +467,30 @@ jobs:
               echo "::error::NDK r27c не найден в $ANDROID_NDK_HOME"
               exit 1
             fi
-            export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang"
+            # rust/cc-крейты: cargo build --target aarch64-linux-android —
+            # build-скрипты (cc, link-cplusplus, cxx) ищут компилятор через env
+            # CC/CXX/AR_<triple> (в bash дефисные имена не заexportить — задаём
+            # подчёркнутые, cc проверяет оба варианта) или «голый»
+            # aarch64-linux-android-clang++ в PATH. Без этого cargo падал:
+            # "Failed to find tool. Is aarch64-linux-android-clang++ installed?".
+            # NDK кладёт ABI-суффиксные обёртки; 24 = ANDROID_NATIVE_API_LEVEL
+            # из cmake_android.sh 17.4. «Голые» обёртки создаём симлинками
+            # (так же делает cargo-ndk).
+            NDK_BIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+            if [ ! -e "$NDK_BIN/aarch64-linux-android24-clang" ] || [ ! -e "$NDK_BIN/aarch64-linux-android24-clang++" ]; then
+              echo "::error::в NDK нет обёрток aarch64-linux-android24-clang(++): $NDK_BIN"
+              exit 1
+            fi
+            export PATH="$NDK_BIN:$PATH"
+            export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$NDK_BIN/aarch64-linux-android24-clang"
+            export CC_aarch64_linux_android="$NDK_BIN/aarch64-linux-android24-clang"
+            export CXX_aarch64_linux_android="$NDK_BIN/aarch64-linux-android24-clang++"
+            export AR_aarch64_linux_android="$NDK_BIN/llvm-ar"
+            for tool in clang clang++; do
+              if [ ! -e "$NDK_BIN/aarch64-linux-android-$tool" ]; then
+                ln -s "aarch64-linux-android24-$tool" "$NDK_BIN/aarch64-linux-android-$tool"
+              fi
+            done
             echo "LEGACY-сборка: DDNet ${DDNET_VERSION:-17.4} | APK-имя T-apk | пакет com.altynekst.tapk (патч build.sh) | VN=$VN | VC=$VC"
             echo "JAVA: $(java -version 2>&1 | head -1)"
             bash scripts/android/cmake_android.sh arm64 "T-apk" Release
@@ -484,8 +507,11 @@ jobs:
             fi
             APK=$(find build_android -maxdepth 1 -name '*.apk' | head -1)
             if [ -z "$APK" ]; then
-              echo "::error::APK не найден в build_android"
-              find build_android -name '*.apk' || true
+              echo "в корне build_android APK нет (cp в build.sh мог не сработать на нестандартном имени выхода) — ищу в глубине"
+              APK=$(find build_android -name '*.apk' | head -1)
+            fi
+            if [ -z "$APK" ]; then
+              echo "::error::APK не найден в build_android — см. вывод gradle выше"
               exit 1
             fi
           else
