@@ -1,0 +1,248 @@
+name: Android APK (arm64)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: android-apk
+  cancel-in-progress: true
+
+jobs:
+  build-android:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      CARGO_HTTP_MULTIPLEXING: false
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Assemble full source (если в репо залит только src/)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -f CMakeLists.txt ]; then
+            echo "репо уже полное — сборка из тарболла не нужна"
+            exit 0
+          fi
+          AUTH="Authorization: token $GITHUB_TOKEN"
+          BASE=$(grep -m1 -E '^#define[[:space:]]+GAME_RELEASE_VERSION[[:space:]]' src/game/version.h | sed -E 's/.*"([^"]*)".*/\1/' | tr '_' '.' || true)
+          if [ -z "$BASE" ]; then BASE=$(grep -m1 '#define GAME_RELEASE_VERSION_INTERNAL' src/game/version.h | awk '{print $3}' | tr -d '"' | tr '_' '.' || true); fi
+          if [ -z "$BASE" ]; then BASE="19.8.2"; fi
+          TAG="$BASE"
+          code=$(curl -s -o /dev/null -w '%{http_code}' -H "$AUTH" "https://api.github.com/repos/ddnet/ddnet/contents/ddnet-libs?ref=$TAG" || echo 000)
+          if [ "$code" != "200" ]; then
+            case "$BASE" in
+              *.*.*) TAG=$(echo "$BASE" | cut -d. -f1-2) ;;
+              *) TAG="19.8.2" ;;
+            esac
+            code=$(curl -s -o /dev/null -w '%{http_code}' -H "$AUTH" "https://api.github.com/repos/ddnet/ddnet/contents/ddnet-libs?ref=$TAG" || echo 000)
+          fi
+          if [ "$code" != "200" ]; then TAG="19.8.2"; fi
+          echo "Базовая версия DDNet: $TAG (из version.h: $BASE)"
+          curl -fL --retry 5 --retry-delay 5 --retry-all-errors -o /tmp/ddnet.tar.gz "https://codeload.github.com/ddnet/ddnet/tar.gz/refs/tags/$TAG"
+          rm -rf /tmp/ddnet_full
+          mkdir -p /tmp/ddnet_full
+          tar --strip-components 1 -C /tmp/ddnet_full -xf /tmp/ddnet.tar.gz
+          shopt -s nullglob
+          for d in /tmp/ddnet_full/* /tmp/ddnet_full/.git*; do
+            b=$(basename "$d")
+            if [ "$b" != "src" ]; then cp -a "$d" .; fi
+          done
+          ROOT="$PWD"
+          (cd /tmp/ddnet_full/src && find . -mindepth 1 -print0 | while IFS= read -r -d '' p; do
+            rel="${p#./}"
+            if [ -d "$p" ]; then
+              mkdir -p "$ROOT/src/$rel"
+            elif [ ! -e "$ROOT/src/$rel" ]; then
+              cp -a "$p" "$ROOT/src/$rel"
+            fi
+          done)
+          echo "Ассемблировано, файлов в корне репо: $(find . -type f | wc -l)"
+
+      - name: Materialize ddnet-libs (динамический пин под версию DDNet)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          AUTH="Authorization: token $GITHUB_TOKEN"
+          BASE=$(grep -m1 -E '^#define[[:space:]]+GAME_RELEASE_VERSION[[:space:]]' src/game/version.h | sed -E 's/.*"([^"]*)".*/\1/' | tr '_' '.' || true)
+          if [ -z "$BASE" ]; then BASE=$(grep -m1 '#define GAME_RELEASE_VERSION_INTERNAL' src/game/version.h | awk '{print $3}' | tr -d '"' | tr '_' '.' || true); fi
+          TAG="$BASE"
+          if [ -z "$TAG" ]; then TAG="19.8.2"; fi
+          LIBS_SHA=$(curl -s -H "$AUTH" "https://api.github.com/repos/ddnet/ddnet/contents/ddnet-libs?ref=$TAG" | python3 -c "import sys,json; print(json.load(sys.stdin).get('sha',''))" || true)
+          if [ -z "$LIBS_SHA" ]; then
+            case "$BASE" in
+              *.*.*) TAG=$(echo "$BASE" | cut -d. -f1-2) ;;
+              *) TAG="19.8.2" ;;
+            esac
+            LIBS_SHA=$(curl -s -H "$AUTH" "https://api.github.com/repos/ddnet/ddnet/contents/ddnet-libs?ref=$TAG" | python3 -c "import sys,json; print(json.load(sys.stdin).get('sha',''))" || true)
+          fi
+          if [ -z "$LIBS_SHA" ]; then
+            TAG="19.8.2"
+            LIBS_SHA="c0e6703fbcdbe03df2f26875427ec3951ce4ec21"
+          fi
+          echo "ddnet-libs пин: $LIBS_SHA (DDNet $TAG)"
+          if [ -f .gitmodules ]; then
+            git submodule update --init --recursive || echo "::warning::git submodule update не удался — будет fallback-клон"
+          fi
+          if [ ! -f ddnet-libs/CMakeLists.txt ]; then
+            echo "::warning::ddnet-libs пуст — клонирую https://github.com/ddnet/ddnet-libs"
+            rm -rf ddnet-libs
+            git clone --recursive https://github.com/ddnet/ddnet-libs.git ddnet-libs
+            (cd ddnet-libs && git checkout -q "$LIBS_SHA" && git submodule update --init --recursive) || echo "оставляю ddnet-libs на HEAD"
+          else
+            echo "ddnet-libs уже с файлами, ок"
+          fi
+
+      - name: Check ddnet-libs (arm64 prebuilt libs)
+        run: |
+          missing=0
+          for f in \
+            ddnet-libs/curl/android/libarm64/libcurl.a \
+            ddnet-libs/boringssl/android/libarm64/libcrypto.a \
+            ddnet-libs/boringssl/android/libarm64/libssl.a \
+            ddnet-libs/freetype/android/libarm64/libfreetype.a \
+            ddnet-libs/png/android/libarm64/libpng16.a \
+            ddnet-libs/opus/android/libarm64/libogg.a \
+            ddnet-libs/opus/android/libarm64/libopus.a \
+            ddnet-libs/opus/android/libarm64/libopusfile.a \
+            ddnet-libs/sdl/android/libarm64/libSDL2.a \
+            ddnet-libs/sqlite3/android/libarm64/libsqlite3.a \
+            ddnet-libs/wavpack/android/libarm64/libwavpack.a \
+            ddnet-libs/CMakeLists.txt; do
+            if [ ! -f "$f" ]; then echo "MISSING: $f"; missing=1; fi
+          done
+          if [ ! -d ddnet-libs/sdl/java/org ]; then echo "MISSING dir: ddnet-libs/sdl/java/org"; missing=1; fi
+          if [ "$missing" = 1 ]; then
+            echo "::error::ddnet-libs: нет прекомпилированных arm64-библиотек"
+            exit 1
+          fi
+          echo "ddnet-libs: все arm64-библиотеки на месте"
+
+      - name: Fail-fast check (android project files)
+        run: |
+          missing=0
+          for f in \
+            CMakeLists.txt \
+            src/game/version.h \
+            scripts/compile_libs/_build_common.sh \
+            scripts/android/cmake_android.sh \
+            scripts/android/download_android_sdk.sh \
+            scripts/android/generate_asset_integrity_index.py \
+            scripts/android/files/build.sh \
+            scripts/android/files/build.gradle \
+            scripts/android/files/settings.gradle \
+            scripts/android/files/gradle.properties \
+            scripts/android/files/proguard-rules.pro \
+            scripts/android/files/AndroidManifest.xml \
+            scripts/android/files/gradlew \
+            scripts/android/files/gradle/wrapper/gradle-wrapper.jar \
+            scripts/android/files/gradle/wrapper/gradle-wrapper.properties \
+            scripts/android/files/java/org/ddnet/client/ClientActivity.java \
+            scripts/android/files/java/org/ddnet/client/ServerService.java; do
+            if [ ! -f "$f" ]; then echo "MISSING: $f"; missing=1; fi
+          done
+          if [ ! -d scripts/android/files/res ]; then echo "MISSING dir: scripts/android/files/res"; missing=1; fi
+          if [ ! -d data ]; then echo "MISSING dir: data"; missing=1; fi
+          if [ "$missing" = 1 ]; then
+            echo "::error::в сурсе нет файлов, нужных для android-сборки (см. MISSING выше)"
+            exit 1
+          fi
+          echo "android-проект: все файлы на месте"
+
+      - name: Patch build.sh (mkdir -p перед mv — баг com.* пакетов)
+        run: |
+          if grep -q 'mv src/main/java/org/ddnet/client' scripts/android/files/build.sh; then
+            if grep -q 'mkdir -p "src/main/java/$(dirname' scripts/android/files/build.sh; then
+              echo "build.sh: mv-патч уже стоит"
+            else
+              sed -i 's|mv src/main/java/org/ddnet/client src/main/java/"${APK_PACKAGE_FOLDER}"|mkdir -p "src/main/java/$(dirname "${APK_PACKAGE_FOLDER}")" \&\& mv src/main/java/org/ddnet/client src/main/java/"${APK_PACKAGE_FOLDER}"|' scripts/android/files/build.sh
+              if grep -q 'mkdir -p "src/main/java/$(dirname' scripts/android/files/build.sh; then
+                echo "build.sh: mv-патч применён (mkdir -p && mv)"
+              else
+                echo "::warning::mv-патч не применился: строка mv отличается от эталона DDNet 19.8.2"
+              fi
+            fi
+          else
+            echo "::warning::mv в build.sh не найден — форк, возможно, уже чинил это"
+          fi
+
+      - name: Icon stub (other/icons/DDNet_256x256x32.png)
+        run: |
+          if [ ! -f other/icons/DDNet_256x256x32.png ]; then
+            echo "::warning::other/icons/DDNet_256x256x32.png нет — кладу заглушку"
+            mkdir -p other/icons
+            printf '%s' 'iVBORw0KGgoAAAANSUhEUgAAAQAAAAEACAYAAABccqhmAAACYUlEQVR42u3UMQEAAAQAQcEEkUhtCmjghivww0d1DvBTiAAGABgAYACAAQAGABgAYACAAQAGABgAYACAAQAGABgAYACAAQAGABgAYACAAQAGABgAYACAAQAGABgAYACAAQAGABgAYACAAQAGABgAYACAAYABiAAGABgAYACAAQAGABgAYACAAQAGABgAYACAAQAGABgAYACAAQAGABgAYACAAQAGABgAYACAAQAGABgAYACAAQAGABgAYACAAQAGABgAYACAAYABiAAGABgAYACAAQAGABgAYACAAQAGABgAYACAAQAGABgAYACAAQAGABgAYACAAQAGABgAYACAAQAGABgAYACAAQAGABgAYACAAQAGABgAYACAAYABCAEGABgAYACAAQAGABgAYACAAQAGABgAYACAAQAGABgAYACAAQAGABgAYACAAQAGABgAYACAAQAGABgAYACAAQAGABgAYACAAQAGABgAYACAAYABAAYAGABgAIABAAYAGABgAIABAAYAGABgAIABAAYAGABgAIABAAYAGABgAIABAAYAGABgAIABAAYAGABgAIABAAYAGABgAIABAAYAGABgAIABgAEABgAYAGAAgAEABgAYAGAAgAEABgAYAGAAgAEABgAYAGAAgAEABgAYAGAAgAEABgAYAGAAgAEABgAYAGAAgAEABgAYAGAAgAEABgAYAGAAgAGAAQAGABgAYACAAQAGABgAYACAAQAGABgAYACAAQAGABgAYACAAQAGABgAYACAAQAGABgAYACAAQAGABgAYACAAQAGABgAYACAAQCXBeFBH3glkSTOAAAAAElFTkSuQmCC' | base64 -d > other/icons/DDNet_256x256x32.png
+          fi
+
+      - name: Prepare Linux
+        run: |
+          sudo apt-get update -y -o Acquire::Retries=5
+          sudo apt-get install -y -o Acquire::Retries=5 ninja-build openjdk-21-jdk openssl
+          curl -fL --retry 5 --retry-delay 5 --retry-all-errors --connect-timeout 30 -o cmake.tar.gz https://github.com/Kitware/CMake/releases/download/v3.22.1/cmake-3.22.1-Linux-x86_64.tar.gz
+          mkdir -p /home/runner/cmake
+          tar --strip-components 1 -C /home/runner/cmake -xf cmake.tar.gz
+          rustup default 1.92.0
+          export CARGO_NET_RETRY=10
+          export CARGO_HTTP_TIMEOUT=120
+          cargo install cargo-ndk
+          rustup target add aarch64-linux-android
+          find scripts -name '*.sh' -exec chmod +x {} +
+          chmod +x scripts/android/files/gradlew
+          bash scripts/android/download_android_sdk.sh /home/runner || { sleep 15; bash scripts/android/download_android_sdk.sh /home/runner; }
+
+      - name: Install Vulkan SDK
+        uses: humbletim/install-vulkan-sdk@v1.2
+        with:
+          version: 1.3.296.0
+          cache: true
+
+      - name: Build Android app (arm64-v8a only)
+        run: |
+          export TW_KEY_NAME=/home/runner/T-apk.jks
+          export TW_KEY_ALIAS=Tapk-Key
+          export TW_KEY_PW="$(openssl rand -base64 32)"
+          keytool -genkey -v -keystore "$TW_KEY_NAME" -keyalg RSA -keysize 2048 -validity 10000 -alias "$TW_KEY_ALIAS" -storepass "$TW_KEY_PW" -dname "CN=T-apk, OU=T-apk, O=T-apk"
+          export ANDROID_HOME="/home/runner/Android/Sdk"
+          unset ANDROID_SDK_ROOT
+          export PATH=/home/runner/cmake/bin:$PATH
+          VN=$(grep -m1 -E '^#define[[:space:]]+GAME_RELEASE_VERSION[[:space:]]' src/game/version.h | sed -E 's/.*"([^"]*)".*/\1/' | tr '_' '.' || true)
+          if [ -z "$VN" ]; then VN=$(grep -m1 '#define GAME_RELEASE_VERSION_INTERNAL' src/game/version.h | awk '{print $3}' | tr -d '"' | tr '_' '.' || true); fi
+          if [ -z "$VN" ]; then VN="1.0"; fi
+          export TW_VERSION_NAME="$VN"
+          VC=$(grep -m1 '#define DDNET_VERSION_NUMBER' src/game/version.h | awk '{print $3}' || true)
+          if [ -z "$VC" ]; then VC="${GITHUB_RUN_NUMBER}"; fi
+          export TW_VERSION_CODE="$VC"
+          GAME=$(grep -m1 '#define GAME_NAME' src/game/version.h | sed -n 's/^#define[[:space:]]*GAME_NAME[[:space:]]*"\([^"]*\)".*/\1/p' || true)
+          if [ -z "$GAME" ]; then GAME=$(grep -im1 '^[[:space:]]*project[[:space:]]*(' CMakeLists.txt | sed 's/^[^(]*project[[:space:]]*(//; s/[^A-Za-z0-9_-].*$//' || true); fi
+          if [ -z "$GAME" ]; then GAME=DDNet; fi
+          echo "GAME_NAME=$GAME | PACKAGE=com.altynekst.tapk | VERSION_NAME=$VN | VERSION_CODE=$VC"
+          bash scripts/android/cmake_android.sh arm64 "$GAME" com.altynekst.tapk Release build-android-release
+          mkdir -p artifacts
+          APK=$(find build-android-release -maxdepth 2 -name '*.apk' | head -1)
+          if [ -z "$APK" ]; then
+            echo "::error::APK не найден в build-android-release"
+            find build-android-release -name '*.apk' || true
+            exit 1
+          fi
+          echo "APK: $APK"
+          cp "$APK" artifacts/T-apk.apk
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: T-apk-android
+          path: artifacts
+
+      - name: Create Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "tapk-v${GITHUB_RUN_NUMBER}" artifacts/T-apk.apk \
+            --title "T-apk APK v${GITHUB_RUN_NUMBER} (arm64)" \
+            --notes "Автосборка T-apk для Android, только 64-бит (arm64-v8a)." \
+          || gh release upload "tapk-v${GITHUB_RUN_NUMBER}" artifacts/T-apk.apk --clobber
