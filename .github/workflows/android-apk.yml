@@ -64,6 +64,55 @@ jobs:
           done)
           echo "Ассемблировано, файлов в корне репо: $(find . -type f | wc -l)"
 
+      - name: Patch datasrc (IMAGE_PET для plusfeatures) + pet.png
+        run: |
+          # plusfeatures.cpp форка использует g_pData->m_aImages[IMAGE_PET].
+          # В DDNet 16.x/17.x client_data.h генерируется datasrc/compile.py из
+          # datasrc/content.py (ванильного, из тарболла) — IMAGE_PET там нет,
+          # сборка падала: "use of undeclared identifier 'IMAGE_PET'".
+          # Добавляю картинку pet в КОНЕЦ списка images (enum строится из
+          # container.images.items по порядку, код обращается к ней по имени,
+          # так что индекс не важен) и кладу data/pet.png (собственный png
+          # форка в src/ не входит). Оба действия идемпотентны.
+          if [ ! -f datasrc/content.py ]; then
+            echo "::warning::datasrc/content.py не найден — патч IMAGE_PET пропущен"
+            exit 0
+          fi
+          if grep -q 'Image("pet"' datasrc/content.py; then
+            echo "IMAGE_PET уже в datasrc/content.py"
+          else
+            printf '\n# T-apk CI: картинка pet для плюс-фич форка (plusfeatures.cpp -> IMAGE_PET)\ncontainer.images.Add(Image("pet", "pet.png"))\n' >> datasrc/content.py
+            echo "::notice::IMAGE_PET добавлен в datasrc/content.py (client_data.h пересоберётся автоматически)"
+          fi
+          if [ ! -f data/pet.png ]; then
+            mkdir -p data
+            printf '%s' 'iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAACMUlEQVR42u2ZTU4DMQyFexbWnIEFB2LdS9BjcAKuA5cAdVsaRCTL2Ikn46mfp4mUxVSJ6/fF+XMOh1lmmWUWx/L0+HDJbH8C8HBwKye3tO3m4Pf7y2/1dnRL2+5Onk9vJifriFrbFrtpAEiOSt8fr8+mdi27cOFfHOXOUrG1lu9a+e+0H7cJCYE7yiFQsVVE77eeTfjRp3UEALcBGwVamHoD0KYX3OJnBTDaDgqARTwV12tjbQcDgc7/iDoBRAKIFh8O4a4B8JNatPi7jYIUi+AoJKttaACl1EvOEvHWftC7AL3hLYGwtB8sBIuQy9fnKgDQU0ASUgT36m4AcAgW8RKEdIvg9aJypCHeEl8uNS0IdIpQu5AAioO8tkaZZnk67f7ZhUqK/GVsj1pdA6Bll54CQ98MSE5gUQT0pkAvArTkKsRUqPPfq/I1gGebwwFoC2JvgdO+uXht4YMCIEGwbHeW0beITwthRDz9H55IhUqWjoKw7PfaISlVnlASazn1wZ4QaVh6Jj54eEMC0OakNvJ19LWw1x5LYBMlFgAj89/6qhQKgI6K5vDoIrgLAGu2wFQApIPJmnOAZC9dBKw9CMFHAF+VvUZfioJ0a0AEgNAtcAJgJzevXIAkHuouoDnjBaD1KAr9SLIFAO1aDHkLvAWA0OfxrSHA3fWRMkJpIHgASCW+AvBMi6cbfU/x6SBYANAXY+vr8W4A8OTmSL8UEKRR7okY7QcP45b9ZpllFnP5AcCfGp+nuwHwAAAAAElFTkSuQmCC' | base64 -d > data/pet.png
+            echo "data/pet.png создан ($(wc -c < data/pet.png) байт)"
+          fi
+
+      - name: Enable exceptions (try/catch в plusfeatures)
+        run: |
+          # DDNet собирается с -fno-exceptions (CMakeLists.txt:
+          # add_cxx_compiler_flag_if_supported(OUR_FLAGS -fno-exceptions)),
+          # а в plusfeatures.cpp форка есть try/catch -> clang падал:
+          # "cannot use 'try' with exceptions disabled". Меняю флаг на
+          # -fexceptions: сам DDNet исключения не бросает, так что поведение
+          # не меняется, зато try/catch в любом файле мода компилируется.
+          if [ ! -f CMakeLists.txt ]; then
+            echo "::warning::CMakeLists.txt не найден — патч exceptions пропущен"
+            exit 0
+          fi
+          if grep -q -- '-fno-exceptions' CMakeLists.txt; then
+            sed -i 's/-fno-exceptions/-fexceptions/g' CMakeLists.txt
+            sed -i 's|# Disable exceptions as DDNet does not use them.|# T-apk CI: exceptions включены (плюс-фичи форка используют try/catch)|' CMakeLists.txt
+            echo "::notice::-fno-exceptions -> -fexceptions в CMakeLists.txt"
+          fi
+          if grep -q -- '-fno-exceptions' CMakeLists.txt; then
+            echo "::warning::-fno-exceptions ещё остался в CMakeLists.txt — try/catch упадёт снова"
+          else
+            echo "исключения включены — try/catch в моде скомпилируется"
+          fi
+
       - name: Inject mod sources into CMake (файлы форка вне списков DDNet)
         run: |
           # Списки исходников в CMakeLists DDNet ЯВНЫЕ (set_src перечисляет файлы
