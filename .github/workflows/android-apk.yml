@@ -89,6 +89,18 @@ jobs:
             printf '%s' 'iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAACMUlEQVR42u2ZTU4DMQyFexbWnIEFB2LdS9BjcAKuA5cAdVsaRCTL2Ikn46mfp4mUxVSJ6/fF+XMOh1lmmWUWx/L0+HDJbH8C8HBwKye3tO3m4Pf7y2/1dnRL2+5Onk9vJifriFrbFrtpAEiOSt8fr8+mdi27cOFfHOXOUrG1lu9a+e+0H7cJCYE7yiFQsVVE77eeTfjRp3UEALcBGwVamHoD0KYX3OJnBTDaDgqARTwV12tjbQcDgc7/iDoBRAKIFh8O4a4B8JNatPi7jYIUi+AoJKttaACl1EvOEvHWftC7AL3hLYGwtB8sBIuQy9fnKgDQU0ASUgT36m4AcAgW8RKEdIvg9aJypCHeEl8uNS0IdIpQu5AAioO8tkaZZnk67f7ZhUqK/GVsj1pdA6Bll54CQ98MSE5gUQT0pkAvArTkKsRUqPPfq/I1gGebwwFoC2JvgdO+uXht4YMCIEGwbHeW0beITwthRDz9H55IhUqWjoKw7PfaISlVnlASazn1wZ4QaVh6Jj54eEMC0OakNvJ19LWw1x5LYBMlFgAj89/6qhQKgI6K5vDoIrgLAGu2wFQApIPJmnOAZC9dBKw9CMFHAF+VvUZfioJ0a0AEgNAtcAJgJzevXIAkHuouoDnjBaD1KAr9SLIFAO1aDHkLvAWA0OfxrSHA3fWRMkJpIHgASCW+AvBMi6cbfU/x6SBYANAXY+vr8W4A8OTmSL8UEKRR7okY7QcP45b9ZpllFnP5AcCfGp+nuwHwAAAAAElFTkSuQmCC' | base64 -d > data/pet.png
             echo "data/pet.png создан ($(wc -c < data/pet.png) байт)"
           fi
+          # CMake DDNet копирует data/ в билд-директорию по ЯВНОМУ списку
+          # EXPECTED_DATA (set_glob: set(${VAR} ${FILES} PARENT_SCOPE) —
+          # НЕ по glob!), поэтому файлы вне списка НЕ попадают в билд-дир
+          # -> не пакуются в assets -> их нет на устройстве. Вписываем pet.png.
+          if [ -f CMakeLists.txt ] && ! grep -q "^  pet\.png$" CMakeLists.txt; then
+            if grep -q "^  arrow\.png$" CMakeLists.txt; then
+              sed -i "s|^  arrow\.png$|  arrow.png\n  pet.png|" CMakeLists.txt
+              echo "pet.png вписан в EXPECTED_DATA (CMakeLists.txt)"
+            else
+              echo "::warning::якорь arrow.png не найден в EXPECTED_DATA — pet.png не попадёт в APK"
+            fi
+          fi
 
       - name: Enable exceptions (try/catch в plusfeatures)
         run: |
@@ -112,6 +124,64 @@ jobs:
           else
             echo "исключения включены — try/catch в моде скомпилируется"
           fi
+
+      - name: Force GLES backend on Android (фикс чёрного экрана)
+        run: |
+          # ПРИЧИНА ЧЁРНОГО ЭКРАНА И ВЫЛЕТА: в DDNet 17.x дефолт gfx_backend = "Vulkan"
+          # (config_variables.h), и на Android клиент стартует с Vulkan-бэкенда,
+          # который на телефонах (Adreno/Mali) в 17.x регулярно крэшит до меню —
+          # процесс умирает молча (чёрный экран -> приложение закрылось).
+          # В DDNet 19.8.2 это исправлено: на CONF_PLATFORM_ANDROID дефолт "GLES".
+          # Ставим то же самое + belt&braces: DDNET_DRIVER=GLES в InitAndroid
+          # (DetectBackend в backend_sdl.cpp читает эту переменную ПЕРЕД конфигом).
+          python3 - <<'PYEOF'
+          import io, os
+
+          def patch(path, pairs):
+              if not os.path.isfile(path):
+                  print("::warning::%s не найден — патч GLES пропущен" % path)
+                  return
+              s = io.open(path, encoding="utf-8").read()
+              changed = False
+              for old, new, label in pairs:
+                  if new in s:
+                      print("%s: уже пропатчен (%s)" % (path, label))
+                      continue
+                  if old not in s:
+                      print("::warning::%s: шаблон не найден (%s)" % (path, label))
+                      continue
+                  s = s.replace(old, new, 1)
+                  changed = True
+                  print("%s: патч применён (%s)" % (path, label))
+              if changed:
+                  io.open(path, "w", encoding="utf-8").write(s)
+
+          patch("src/engine/shared/config_variables.h", [(
+              '#if !defined(CONF_ARCH_IA32) && !defined(CONF_PLATFORM_MACOS)\n'
+              'MACRO_CONFIG_STR(GfxBackend, gfx_backend, 256, "Vulkan", CFGFLAG_SAVE | CFGFLAG_CLIENT, "The backend to use (e.g. OpenGL or Vulkan)")\n'
+              '#else\n',
+              '#if defined(CONF_PLATFORM_ANDROID)\n'
+              'MACRO_CONFIG_STR(GfxBackend, gfx_backend, 256, "GLES", CFGFLAG_SAVE | CFGFLAG_CLIENT, "The backend to use (e.g. GLES or Vulkan)")\n'
+              '#elif defined(CONF_PLATFORM_EMSCRIPTEN)\n'
+              'MACRO_CONFIG_STR(GfxBackend, gfx_backend, 256, "GLES", CFGFLAG_SAVE | CFGFLAG_CLIENT, "The backend to use (e.g. GLES)")\n'
+              '#elif !defined(CONF_ARCH_IA32) && !defined(CONF_PLATFORM_MACOS)\n'
+              'MACRO_CONFIG_STR(GfxBackend, gfx_backend, 256, "Vulkan", CFGFLAG_SAVE | CFGFLAG_CLIENT, "The backend to use (e.g. OpenGL or Vulkan)")\n'
+              '#else\n',
+              'дефолт GLES на Android'),
+          ])
+
+          patch("src/android/android_main.cpp", [
+              ('#include <sys/stat.h>',
+               '#include <stdlib.h>\n#include <sys/stat.h>', 'include <stdlib.h>'),
+              ('gs_AndroidStarted = true;',
+               'gs_AndroidStarted = true;\n\tsetenv("DDNET_DRIVER", "GLES", 1);',
+               'setenv DDNET_DRIVER=GLES'),
+          ])
+          PYEOF
+          if grep -q "DDNET_DRIVER" src/android/android_main.cpp 2>/dev/null; then
+            echo "GLES-фикс: DDNET_DRIVER=GLES будет выставлен при старте (InitAndroid)"
+          fi
+          grep -n 'gfx_backend, 256' src/engine/shared/config_variables.h 2>/dev/null | head -2 || true
 
       - name: Inject mod sources into CMake (файлы форка вне списков DDNet)
         run: |
@@ -492,8 +562,13 @@ jobs:
         run: |
           export TW_KEY_NAME=/home/runner/T-apk.jks
           export TW_KEY_ALIAS=Tapk-Key
-          export TW_KEY_PW="$(openssl rand -base64 32)"
-          keytool -genkey -v -keystore "$TW_KEY_NAME" -keyalg RSA -keysize 2048 -validity 10000 -alias "$TW_KEY_ALIAS" -storepass "$TW_KEY_PW" -dname "CN=T-apk, OU=T-apk, O=T-apk"
+          export TW_KEY_PW="TapkSign2026"
+          # ПОСТОЯННЫЙ ключ подписи (вшит в скрипт): одна и та же подпись во всех
+          # сборках -> обновление ставится ПОВЕРХ предыдущего БЕЗ удаления,
+          # данные игры (настройки/демо) не стираются между сборками.
+          printf '%s' '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' | base64 -d > "$TW_KEY_NAME"
+          keytool -list -keystore "$TW_KEY_NAME" -storepass "$TW_KEY_PW" >/dev/null 2>&1 || { echo "::error::вшитый keystore не читается"; exit 1; }
+          echo "подпись: постоянный keystore CN=T-apk (alias $TW_KEY_ALIAS)"
           export ANDROID_HOME="/home/runner/Android/Sdk"
           export ANDROID_SDK_ROOT="/home/runner/Android/Sdk"
           if [ -n "${VULKAN_SDK:-}" ]; then export PATH="$VULKAN_SDK/bin:$PATH"; fi
@@ -593,6 +668,22 @@ jobs:
           fi
           echo "APK: $APK"
           cp "$APK" artifacts/T-apk.apk
+          # T-apk CI: unstripped libDDNet.so — по нему addr2line расшифровывает
+          # бэктрейсы из logcat (APK внутри всегда стрипнут AGP)
+          UNSTRIPPED=""
+          for c in build_android/build_arch/arm64/libDDNet.so build-android-release/build_arch/arm64/libDDNet.so; do
+            if [ -f "$c" ]; then UNSTRIPPED="$c"; break; fi
+          done
+          if [ -z "$UNSTRIPPED" ]; then
+            UNSTRIPPED=$(find build_android build-android-release -type f -name 'libDDNet.so' ! -path '*/lib/arm64-v8a/*' -size +8M 2>/dev/null | head -1)
+          fi
+          if [ -n "$UNSTRIPPED" ]; then
+            cp "$UNSTRIPPED" artifacts/libDDNet-unstripped.so
+            echo "unstripped libDDNet.so: $UNSTRIPPED ($(wc -c < artifacts/libDDNet-unstripped.so) байт)"
+          else
+            echo "::warning::unstripped libDDNet.so не найден — бэктрейсы останутся без символов"
+          fi
+          echo "SHA-256 APK: $(sha256sum artifacts/T-apk.apk | awk '{print $1}')"
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
@@ -604,7 +695,90 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          SHASUM=$(sha256sum artifacts/T-apk.apk | awk '{print $1}')
           gh release create "tapk-v${GITHUB_RUN_NUMBER}" artifacts/T-apk.apk \
             --title "T-apk APK v${GITHUB_RUN_NUMBER} (arm64)" \
-            --notes "Автосборка T-apk для Android, только 64-бит (arm64-v8a)." \
+            --notes "Автосборка T-apk для Android, только 64-бит (arm64-v8a). SHA-256: $SHASUM" \
           || gh release upload "tapk-v${GITHUB_RUN_NUMBER}" artifacts/T-apk.apk --clobber
+
+  smoke-test:
+    needs: build-android
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Download APK artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: T-apk-android
+          path: apk
+
+      - name: Install JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install system image (x86_64 + встроенная ARM-трансляция)
+        run: |
+          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$PATH"
+          sudo apt-get update -y -o Acquire::Retries=5 >/dev/null 2>&1 || true
+          sudo apt-get install -y -o Acquire::Retries=5 libpulse0 >/dev/null 2>&1 || true
+          yes | sdkmanager --licenses >/dev/null || true
+          yes | sdkmanager "platform-tools" "emulator" "system-images;android-30;google_apis;x86_64" > /tmp/sdk.log 2>&1 || { tail -20 /tmp/sdk.log; echo "::error::sdkmanager не установил образ"; exit 1; }
+          echo "SDK готов: $(ls "$ANDROID_HOME/system-images/android-30/google_apis" 2>/dev/null)"
+
+      - name: Boot emulator + launch game + logcat
+        run: |
+          export PATH="$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$ANDROID_HOME/cmdline-tools/latest/bin:$PATH"
+          if [ -e /dev/kvm ]; then sudo chmod 666 /dev/kvm; echo "KVM: есть"; else echo "::error::/dev/kvm нет на раннере"; exit 1; fi
+          echo no | avdmanager --sdk_root="$ANDROID_HOME" create avd -n tapk -k "system-images;android-30;google_apis;x86_64" -d pixel_5 --force
+          emulator -avd tapk -no-window -no-audio -no-boot-anim -no-snapshot -gpu swiftshader_indirect -memory 3072 -cores 4 &
+          adb wait-for-device
+          B=""
+          for i in $(seq 1 45); do
+            B=$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r\n ')
+            [ "$B" = "1" ] && break
+            sleep 10
+          done
+          if [ "$B" != "1" ]; then
+            echo "::error::эмулятор не загрузился за 7.5 минут"
+            adb devices -l
+            exit 1
+          fi
+          echo "=== ЭМУЛЯТОР ЗАГРУЗИЛСЯ ==="
+          adb install -r -g apk/T-apk.apk || { echo "::error::adb install провалился"; adb logcat -d | tail -100; exit 1; }
+          echo "=== APK УСТАНОВЛЕН ==="
+          ACT=$(adb shell cmd package resolve-activity --brief com.altynekst.tapk 2>/dev/null | tail -1 | tr -d '\r\n')
+          echo "launcher activity: $ACT"
+          adb shell am start -n "$ACT" 2>/dev/null || adb shell monkey -p com.altynekst.tapk -c android.intent.category.LAUNCHER 1
+          echo "=== ИГРА ЗАПУЩЕНА, наблюдаю 300 сек ==="
+          DEAD=""
+          for i in $(seq 1 60); do
+            sleep 5
+            PID=$(adb shell pidof com.altynekst.tapk 2>/dev/null | tr -d '\r\n ')
+            if [ -z "$PID" ]; then DEAD=1; echo ">>> процесс умер через ~$((i*5)) сек после запуска"; break; fi
+            if [ $((i % 6)) = 0 ]; then echo "...жив после $((i*5)) сек (pid $PID)"; fi
+          done
+          if [ -n "$DEAD" ]; then
+            echo "=== РЕЗУЛЬТАТ: ПРОЦЕСС УМЕР — чёрный экран + вылет воспроизведены ==="
+          else
+            echo "=== РЕЗУЛЬТАТ: ПРОЦЕСС ЖИВ 300 сек — краша на эмуляторе нет ==="
+          fi
+          mkdir -p artifacts
+          adb logcat -d -b crash > artifacts/logcat-crash.txt 2>/dev/null || true
+          adb logcat -d > artifacts/logcat-full.txt 2>/dev/null || true
+          adb shell screencap -p /sdcard/tapk-screen.png >/dev/null 2>&1 || true
+          adb pull /sdcard/tapk-screen.png artifacts/screen.png >/dev/null 2>&1 || true
+          echo "=== CRASH BUFFER (полностью) ==="
+          cat artifacts/logcat-crash.txt || true
+          echo "=== MAIN BUFFER: строки про крэш/игру ==="
+          grep -aE "FATAL EXCEPTION|Fatal signal|SIGSEGV|SIGABRT|SIGBUS|SIGILL|AndroidRuntime|libDDNet|SDL|backtrace|abort message|Build fingerprint|com\.altynekst\.tapk|DDNet|ddnet" artifacts/logcat-full.txt | head -400 || true
+          echo "=== MAIN BUFFER: последние 120 строк ==="
+          tail -120 artifacts/logcat-full.txt || true
+          echo "=== скриншот и полные логи — в артефакте T-apk-smoke-logs ==="
+
+      - name: Upload smoke logs
+        uses: actions/upload-artifact@v4
+        with:
+          name: T-apk-smoke-logs
+          path: artifacts
