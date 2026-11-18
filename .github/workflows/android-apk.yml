@@ -1,4 +1,4 @@
-name: Android APK (T-apk, arm64)
+name: Android APK (arm64)
 
 on:
   push:
@@ -12,33 +12,32 @@ concurrency:
   group: android-apk
   cancel-in-progress: true
 
-env:
-  NULLCKI_REPO: altynekst/Nullcki
-  NULLCKI_SHA: 59e02c55e7db054795c66088f946baa80807e84f
-  NULLCKI_EPOCH: "1794342426"
-  DDNET_LIBS_SHA: c0e6703fbcdbe03df2f26875427ec3951ce4ec21
-
 jobs:
   build-android:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     env:
       CARGO_HTTP_MULTIPLEXING: false
+      FORK_SRC_SHA: "dcaa51d597834a90c95db9f5ca12c8afc6950671"
+      FORK_SRC_EPOCH: "1795010591"
+      UPSTREAM_TAG: "17.4"
+      NULLCKI_SHA: "59e02c55e7db054795c66088f946baa80807e84f"
+      DDNET_LIBS_SHA: "59d64dbb36ade02607ad20a7f3a45605ab1de80d"
     steps:
       - uses: actions/checkout@v5
 
-      - name: Fetch Nullcki source (жёсткий пин)
+      - name: Fetch fork source (жёсткий пин T-apk @ dcaa51d597) + overlay DDNet 17.4
         run: |
-          # Сурс НЕ хранится в репо — качаем клиент по пину (codeload-тарболл,
-          # без git, детерминированно). Рабочую папку чистим: старый src/ из
-          # репо больше не участвует в сборке.
+          # Сурс НЕ хранится в репо: берём сурс форка (TaterClient на DDNet 17.4)
+          # из пина коммита FORK_SRC_SHA репо altynekst/T-apk (codeload-тарболл).
           find . -mindepth 1 -maxdepth 1 ! -name .github -exec rm -rf {} +
+          cp -a .github /tmp/workflow_github
           ok=0
           for i in 1 2 3; do
-            code=$(curl -L --retry 5 --retry-delay 5 --retry-all-errors --connect-timeout 30 -s -o /tmp/nullcki.tgz -w '%{http_code}' "https://codeload.github.com/${NULLCKI_REPO}/tar.gz/${NULLCKI_SHA}" || echo 000)
-            if [ "$code" = "200" ] && [ -s /tmp/nullcki.tgz ]; then
-              if tar --strip-components 1 -C . -xf /tmp/nullcki.tgz; then ok=1; break; fi
-              echo "попытка $i: тарболл битый: $(tail -c 200 /tmp/nullcki.tgz | strings | head -2)"
+            code=$(curl -L --retry 5 --retry-delay 5 --retry-all-errors --connect-timeout 30 -s -o /tmp/fork.tgz -w '%{http_code}' "https://codeload.github.com/altynekst/T-apk/tar.gz/${FORK_SRC_SHA}" || echo 000)
+            if [ "$code" = "200" ] && [ -s /tmp/fork.tgz ]; then
+              if tar --strip-components 1 -C . -xf /tmp/fork.tgz; then ok=1; break; fi
+              echo "попытка $i: тарболл форка битый"
               sleep 10
             else
               echo "попытка $i: codeload http=$code — повтор через 15 сек"
@@ -46,58 +45,242 @@ jobs:
             fi
           done
           if [ "$ok" != 1 ]; then
-            echo "::error::тарболл ${NULLCKI_REPO} @ ${NULLCKI_SHA} не скачался за 3 попытки"
+            echo "::error::тарболл форка altynekst/T-apk @ ${FORK_SRC_SHA:0:10} не скачался за 3 попытки"
             exit 1
           fi
-          rm -f /tmp/nullcki.tgz
-          # cmake_android.sh требует воспроизводимую сборку: .git в workspace
-          # нет (тарболл) — дата пина кладётся в файл, скрипт его подхватит
-          printf '%s' "$NULLCKI_EPOCH" > source_date_epoch
-          VN=$(grep -m1 '#define GAME_RELEASE_VERSION_INTERNAL' src/game/version.h | awk '{print $3}' | tr -d '"' || true)
-          echo "Nullcki @ ${NULLCKI_SHA:0:10} | база DDNet: ${VN:-unknown}"
-          if [ "$VN" != "20.2.1" ]; then echo "::warning::ожидали DDNet 20.2.1, в version.h: ${VN:-пусто}"; fi
-          echo "файлов в дереве: $(find . -type f ! -path './.github/*' | wc -l)"
-
-      - name: Fail-fast check (файлы android-сборки в пине)
-        run: |
-          missing=0
-          for f in \
-            CMakeLists.txt \
-            src/game/version.h \
-            Cargo.toml \
-            Cargo.lock \
-            scripts/android/cmake_android.sh \
-            scripts/android/download_android_sdk.sh \
-            scripts/android/generate_asset_integrity_index.py \
-            scripts/compile_libs/_build_common.sh \
-            scripts/android/files/build.sh \
-            scripts/android/files/build.gradle \
-            scripts/android/files/settings.gradle \
-            scripts/android/files/gradle.properties \
-            scripts/android/files/proguard-rules.pro \
-            scripts/android/files/AndroidManifest.xml \
-            scripts/android/files/gradlew \
-            scripts/android/files/gradle/wrapper/gradle-wrapper.jar \
-            scripts/android/files/gradle/wrapper/gradle-wrapper.properties \
-            scripts/android/files/java/org/ddnet/client/ClientActivity.java \
-            scripts/android/files/java/org/ddnet/client/ServerService.java \
-            other/icons/DDNet_256x256x32.png; do
-            if [ ! -f "$f" ]; then echo "MISSING: $f"; missing=1; fi
+          rm -f /tmp/fork.tgz
+          # .github из тарболла форка НЕ нужен (там старый workflow) — восстанавливаем checkout-овский
+          rm -rf .github
+          cp -a /tmp/workflow_github .github
+          # Апстрим DDNet ${UPSTREAM_TAG}: корень дерева (CMakeLists, data/, scripts/, cmake/, ...)
+          # КЛЮЧ: файлы форка имеют приоритет, апстрим только ДОПОЛНЯЕТ недостающее.
+          ok=0
+          for i in 1 2 3; do
+            code=$(curl -L --retry 5 --retry-delay 5 --retry-all-errors --connect-timeout 30 -s -o /tmp/ddnet_full.tgz -w '%{http_code}' "https://codeload.github.com/ddnet/ddnet/tar.gz/refs/tags/${UPSTREAM_TAG}" || echo 000)
+            if [ "$code" = "200" ] && [ -s /tmp/ddnet_full.tgz ]; then
+              rm -rf /tmp/ddnet_full
+              mkdir -p /tmp/ddnet_full
+              if tar --strip-components 1 -C /tmp/ddnet_full -xf /tmp/ddnet_full.tgz; then ok=1; break; fi
+              echo "попытка $i: тарболл апстрима битый"
+              sleep 10
+            else
+              echo "попытка $i: codeload http=$code — повтор через 15 сек"
+              sleep 15
+            fi
           done
-          if [ ! -d data ]; then echo "MISSING dir: data"; missing=1; fi
-          if [ ! -d scripts/android/files/res ]; then echo "MISSING dir: scripts/android/files/res"; missing=1; fi
-          if [ "$missing" = 1 ]; then
-            echo "::error::в пине Nullcki нет файлов, нужных для android-сборки"
+          if [ "$ok" != 1 ]; then
+            echo "::error::тарболл ddnet/ddnet @ ${UPSTREAM_TAG} не скачался за 3 попытки"
             exit 1
           fi
-          # GLES-дефолт на Android (фикс чёрного экрана, в 19.8+ он есть) —
-          # проверяем, что патч этого не нужен
-          if ! grep -q 'MACRO_CONFIG_STR(GfxBackend, gfx_backend, 256, "GLES"' src/engine/shared/config_variables.h; then
-            echo "::warning::дефолт gfx_backend на Android не GLES — возможен чёрный экран"
+          rm -f /tmp/ddnet_full.tgz
+          ROOT="$PWD"
+          for d in /tmp/ddnet_full/* /tmp/ddnet_full/.git*; do
+            b=$(basename "$d")
+            if [ "$b" != "src" ] && [ "$b" != "ddnet-libs" ] && [ "$b" != ".github" ]; then cp -a "$d" .; fi
+          done
+          (cd /tmp/ddnet_full/src && find . -mindepth 1 -print0 | while IFS= read -r -d '' p; do
+            rel="${p#./}"
+            if [ -d "$p" ]; then
+              mkdir -p "$ROOT/src/$rel"
+            elif [ ! -e "$ROOT/src/$rel" ]; then
+              cp -a "$p" "$ROOT/src/$rel"
+            fi
+          done)
+          # воспроизводимая сборка: .git в workspace нет (тарболлы) — дата коммита
+          # форка кладётся в файл, cmake_android.sh 17.4 его подхватывает
+          printf '%s' "${FORK_SRC_EPOCH}" > source_date_epoch
+          VN=$(grep -m1 -E '^#define[[:space:]]+GAME_RELEASE_VERSION[[:space:]]+"' src/game/version.h | sed -E 's/.*"([^"]*)".*/\1/' || true)
+          echo "форк @ ${FORK_SRC_SHA:0:10} (TaterClient) | база DDNet: ${VN:-?} | файлов: $(find . -type f ! -path './.github/*' | wc -l)"
+      - name: Backport touch controls (Nullcki 20.2.1 -> fork 17.4)
+        run: |
+          # Логика меню и touch-управления из клиента Nullcki (его файлы
+          # touch_controls.* идентичны апстриму DDNet 20.2.1) переносятся в
+          # форк T-apk: сенсорные кнопки (джойстик/прыжок/огонь/крюк),
+          # тач-эмуляция мыши в меню, тач-ряд в игровом меню, версия клиента
+          # -> 20.2.1. Скрипт бэкпорта вшит в upload_tapk.py (base64+gzip).
+          NULLCKI_RAW="https://raw.githubusercontent.com/altynekst/Nullcki/${NULLCKI_SHA}"
+          ok=0
+          for i in 1 2 3; do
+            ok=1
+            curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors -o src/game/client/components/touch_controls.cpp "$NULLCKI_RAW/src/game/client/components/touch_controls.cpp" || ok=0
+            curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors -o src/game/client/components/touch_controls.h "$NULLCKI_RAW/src/game/client/components/touch_controls.h" || ok=0
+            curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors -o data/touch_controls.json "$NULLCKI_RAW/data/touch_controls.json" || ok=0
+            if [ "$ok" = 1 ] && [ -s src/game/client/components/touch_controls.cpp ] && [ -s src/game/client/components/touch_controls.h ] && [ -s data/touch_controls.json ]; then
+              break
+            fi
+            ok=0
+            echo "попытка $i: файлы Nullcki не скачались — повтор через 10 сек"
+            sleep 10
+          done
+          if [ "$ok" != 1 ]; then
+            echo "::error::файлы touch_controls из Nullcki не скачались"
+            exit 1
           fi
-          echo "fail-fast ok: все файлы android-сборки на месте"
+          echo "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" | base64 -d | gunzip > /tmp/backport_touch.py
+          python3 /tmp/backport_touch.py .
+          echo "версия клиента после бэкпорта: $(grep -m1 'GAME_RELEASE_VERSION' src/game/version.h | sed -E 's/.*"([^"]*)".*/\1/')"
 
-      - name: Materialize ddnet-libs (пин, тарболл без git)
+      - name: Patch datasrc (IMAGE_PET для plusfeatures) + pet.png
+        run: |
+          # plusfeatures.cpp форка использует g_pData->m_aImages[IMAGE_PET].
+          # В DDNet 16.x/17.x client_data.h генерируется datasrc/compile.py из
+          # datasrc/content.py (ванильного, из тарболла) — IMAGE_PET там нет,
+          # сборка падала: "use of undeclared identifier 'IMAGE_PET'".
+          # Добавляю картинку pet в КОНЕЦ списка images (enum строится из
+          # container.images.items по порядку, код обращается к ней по имени,
+          # так что индекс не важен) и кладу data/pet.png (собственный png
+          # форка в src/ не входит). Оба действия идемпотентны.
+          if [ ! -f datasrc/content.py ]; then
+            echo "::warning::datasrc/content.py не найден — патч IMAGE_PET пропущен"
+            exit 0
+          fi
+          if grep -q 'Image("pet"' datasrc/content.py; then
+            echo "IMAGE_PET уже в datasrc/content.py"
+          else
+            printf '\n# T-apk CI: картинка pet для плюс-фич форка (plusfeatures.cpp -> IMAGE_PET)\ncontainer.images.Add(Image("pet", "pet.png"))\n' >> datasrc/content.py
+            echo "::notice::IMAGE_PET добавлен в datasrc/content.py (client_data.h пересоберётся автоматически)"
+          fi
+          if [ ! -f data/pet.png ]; then
+            mkdir -p data
+            printf '%s' 'iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAACMUlEQVR42u2ZTU4DMQyFexbWnIEFB2LdS9BjcAKuA5cAdVsaRCTL2Ikn46mfp4mUxVSJ6/fF+XMOh1lmmWUWx/L0+HDJbH8C8HBwKye3tO3m4Pf7y2/1dnRL2+5Onk9vJifriFrbFrtpAEiOSt8fr8+mdi27cOFfHOXOUrG1lu9a+e+0H7cJCYE7yiFQsVVE77eeTfjRp3UEALcBGwVamHoD0KYX3OJnBTDaDgqARTwV12tjbQcDgc7/iDoBRAKIFh8O4a4B8JNatPi7jYIUi+AoJKttaACl1EvOEvHWftC7AL3hLYGwtB8sBIuQy9fnKgDQU0ASUgT36m4AcAgW8RKEdIvg9aJypCHeEl8uNS0IdIpQu5AAioO8tkaZZnk67f7ZhUqK/GVsj1pdA6Bll54CQ98MSE5gUQT0pkAvArTkKsRUqPPfq/I1gGebwwFoC2JvgdO+uXht4YMCIEGwbHeW0beITwthRDz9H55IhUqWjoKw7PfaISlVnlASazn1wZ4QaVh6Jj54eEMC0OakNvJ19LWw1x5LYBMlFgAj89/6qhQKgI6K5vDoIrgLAGu2wFQApIPJmnOAZC9dBKw9CMFHAF+VvUZfioJ0a0AEgNAtcAJgJzevXIAkHuouoDnjBaD1KAr9SLIFAO1aDHkLvAWA0OfxrSHA3fWRMkJpIHgASCW+AvBMi6cbfU/x6SBYANAXY+vr8W4A8OTmSL8UEKRR7okY7QcP45b9ZpllFnP5AcCfGp+nuwHwAAAAAElFTkSuQmCC' | base64 -d > data/pet.png
+            echo "data/pet.png создан ($(wc -c < data/pet.png) байт)"
+          fi
+          # CMake DDNet копирует data/ в билд-директорию по ЯВНОМУ списку
+          # EXPECTED_DATA (set_glob: set(${VAR} ${FILES} PARENT_SCOPE) —
+          # НЕ по glob!), поэтому файлы вне списка НЕ попадают в билд-дир
+          # -> не пакуются в assets -> их нет на устройстве. Вписываем pet.png.
+          if [ -f CMakeLists.txt ] && ! grep -q "^  pet\.png$" CMakeLists.txt; then
+            if grep -q "^  arrow\.png$" CMakeLists.txt; then
+              sed -i "s|^  arrow\.png$|  arrow.png\n  pet.png|" CMakeLists.txt
+              echo "pet.png вписан в EXPECTED_DATA (CMakeLists.txt)"
+            else
+              echo "::warning::якорь arrow.png не найден в EXPECTED_DATA — pet.png не попадёт в APK"
+            fi
+          fi
+
+      - name: Enable exceptions (try/catch в plusfeatures)
+        run: |
+          # DDNet собирается с -fno-exceptions (CMakeLists.txt:
+          # add_cxx_compiler_flag_if_supported(OUR_FLAGS -fno-exceptions)),
+          # а в plusfeatures.cpp форка есть try/catch -> clang падал:
+          # "cannot use 'try' with exceptions disabled". Меняю флаг на
+          # -fexceptions: сам DDNet исключения не бросает, так что поведение
+          # не меняется, зато try/catch в любом файле мода компилируется.
+          if [ ! -f CMakeLists.txt ]; then
+            echo "::warning::CMakeLists.txt не найден — патч exceptions пропущен"
+            exit 0
+          fi
+          if grep -q -- '-fno-exceptions' CMakeLists.txt; then
+            sed -i 's/-fno-exceptions/-fexceptions/g' CMakeLists.txt
+            sed -i 's|# Disable exceptions as DDNet does not use them.|# T-apk CI: exceptions включены (плюс-фичи форка используют try/catch)|' CMakeLists.txt
+            echo "::notice::-fno-exceptions -> -fexceptions в CMakeLists.txt"
+          fi
+          if grep -q -- '-fno-exceptions' CMakeLists.txt; then
+            echo "::warning::-fno-exceptions ещё остался в CMakeLists.txt — try/catch упадёт снова"
+          else
+            echo "исключения включены — try/catch в моде скомпилируется"
+          fi
+
+      - name: Force GLES backend on Android (фикс чёрного экрана)
+        run: |
+          # ПРИЧИНА ЧЁРНОГО ЭКРАНА И ВЫЛЕТА: в DDNet 17.x дефолт gfx_backend = "Vulkan"
+          # (config_variables.h), и на Android клиент стартует с Vulkan-бэкенда,
+          # который на телефонах (Adreno/Mali) в 17.x регулярно крэшит до меню —
+          # процесс умирает молча (чёрный экран -> приложение закрылось).
+          # В DDNet 19.8.2 это исправлено: на CONF_PLATFORM_ANDROID дефолт "GLES".
+          # Ставим то же самое + belt&braces: DDNET_DRIVER=GLES в InitAndroid
+          # (DetectBackend в backend_sdl.cpp читает эту переменную ПЕРЕД конфигом).
+          python3 - <<'PYEOF'
+          import io, os
+
+          def patch(path, pairs):
+              if not os.path.isfile(path):
+                  print("::warning::%s не найден — патч GLES пропущен" % path)
+                  return
+              s = io.open(path, encoding="utf-8").read()
+              changed = False
+              for old, new, label in pairs:
+                  if new in s:
+                      print("%s: уже пропатчен (%s)" % (path, label))
+                      continue
+                  if old not in s:
+                      print("::warning::%s: шаблон не найден (%s)" % (path, label))
+                      continue
+                  s = s.replace(old, new, 1)
+                  changed = True
+                  print("%s: патч применён (%s)" % (path, label))
+              if changed:
+                  io.open(path, "w", encoding="utf-8").write(s)
+
+          patch("src/engine/shared/config_variables.h", [(
+              '#if !defined(CONF_ARCH_IA32) && !defined(CONF_PLATFORM_MACOS)\n'
+              'MACRO_CONFIG_STR(GfxBackend, gfx_backend, 256, "Vulkan", CFGFLAG_SAVE | CFGFLAG_CLIENT, "The backend to use (e.g. OpenGL or Vulkan)")\n'
+              '#else\n',
+              '#if defined(CONF_PLATFORM_ANDROID)\n'
+              'MACRO_CONFIG_STR(GfxBackend, gfx_backend, 256, "GLES", CFGFLAG_SAVE | CFGFLAG_CLIENT, "The backend to use (e.g. GLES or Vulkan)")\n'
+              '#elif defined(CONF_PLATFORM_EMSCRIPTEN)\n'
+              'MACRO_CONFIG_STR(GfxBackend, gfx_backend, 256, "GLES", CFGFLAG_SAVE | CFGFLAG_CLIENT, "The backend to use (e.g. GLES)")\n'
+              '#elif !defined(CONF_ARCH_IA32) && !defined(CONF_PLATFORM_MACOS)\n'
+              'MACRO_CONFIG_STR(GfxBackend, gfx_backend, 256, "Vulkan", CFGFLAG_SAVE | CFGFLAG_CLIENT, "The backend to use (e.g. OpenGL or Vulkan)")\n'
+              '#else\n',
+              'дефолт GLES на Android'),
+          ])
+
+          patch("src/android/android_main.cpp", [
+              ('#include <sys/stat.h>',
+               '#include <stdlib.h>\n#include <sys/stat.h>', 'include <stdlib.h>'),
+              ('gs_AndroidStarted = true;',
+               'gs_AndroidStarted = true;\n\tsetenv("DDNET_DRIVER", "GLES", 1);',
+               'setenv DDNET_DRIVER=GLES'),
+          ])
+          PYEOF
+          if grep -q "DDNET_DRIVER" src/android/android_main.cpp 2>/dev/null; then
+            echo "GLES-фикс: DDNET_DRIVER=GLES будет выставлен при старте (InitAndroid)"
+          fi
+          grep -n 'gfx_backend, 256' src/engine/shared/config_variables.h 2>/dev/null | head -2 || true
+
+      - name: Inject mod sources into CMake (файлы форка вне списков DDNet)
+        run: |
+          # Списки исходников в CMakeLists DDNet ЯВНЫЕ (set_src перечисляет файлы
+          # поимённо). Файлы, добавленные форком (компоненты клиента и т.п.), в
+          # эти списки не попадают -> undefined references при линковке ->
+          # libDDNet.so не собирается, а gradle молча собирает APK без нативных
+          # библиотек (mergeReleaseNativeLibs NO-SOURCE). Лечится добавлением
+          # новых файлов форка в цель game-client через target_sources().
+          if [ ! -d /tmp/ddnet_full/src ]; then
+            echo "тарболл DDNet не ассемблировался (репо полное) — не с чем сравнивать, пропускаю"
+            exit 0
+          fi
+          (cd /tmp/ddnet_full && find src -type f \( -name '*.cpp' -o -name '*.c' \) | sort) > /tmp/vanilla_src.txt
+          find src -type f \( -name '*.cpp' -o -name '*.c' \) | sort > /tmp/fork_src.txt
+          MISSING=$(comm -13 /tmp/fork_src.txt /tmp/vanilla_src.txt || true)
+          if [ -n "$MISSING" ]; then
+            echo "::warning::в форке нет файлов, которые есть в DDNet (если удалены намеренно — ок, но это может ломать сборку):"
+            echo "$MISSING" | head -10
+          fi
+          EXTRAS=$(comm -23 /tmp/fork_src.txt /tmp/vanilla_src.txt | grep -vE '^src/(game/server|tools|mastersrv|masterping|test|other)/' || true)
+          if [ -z "$EXTRAS" ]; then
+            echo "форк не добавляет новых .cpp — target_sources не нужен"
+            exit 0
+          fi
+          echo "новые исходники форка (пойдут в game-client):"
+          echo "$EXTRAS"
+          TGT_FILE=$(grep -lE 'add_library\(game-client SHARED|add_executable\(game-client' CMakeLists.txt src/CMakeLists.txt 2>/dev/null | head -1 || true)
+          if [ -z "$TGT_FILE" ]; then
+            echo "::error::не нашёл CMakeLists, где создаётся цель game-client"
+            exit 1
+          fi
+          {
+            echo ""
+            echo "# T-apk CI: исходники мода форка, отсутствующие в списках CMakeLists DDNet"
+            echo "target_sources(game-client PRIVATE"
+            echo "$EXTRAS" | sed 's/^/  /'
+            echo ")"
+          } >> "$TGT_FILE"
+          echo "=== добавлено в конец $TGT_FILE: ==="
+          tail -n $(( $(printf '%s\n' "$EXTRAS" | wc -l) + 4 )) "$TGT_FILE"
+
+      - name: Materialize ddnet-libs (фикс-пин эпохи DDNet 17.4)
         run: |
           ok=0
           for i in 1 2 3; do
@@ -154,6 +337,8 @@ jobs:
             if [ ! -f "$f" ]; then echo "MISSING: $f"; missing=1; fi
           done
           if [ ! -d ddnet-libs/sdl/java/org ]; then echo "MISSING dir: ddnet-libs/sdl/java/org"; missing=1; fi
+          # заголовки boringssl обязательны: FindCrypto ищет openssl/*.h
+          # в ddnet-libs/boringssl/include[/android]/openssl
           if [ ! -f ddnet-libs/boringssl/include/android/openssl/base.h ] && [ ! -f ddnet-libs/boringssl/include/openssl/base.h ]; then
             echo "MISSING: ddnet-libs/boringssl/include[/android]/openssl/base.h"
             missing=1
@@ -164,6 +349,181 @@ jobs:
           fi
           echo "ddnet-libs: все arm64-библиотеки на месте"
 
+      - name: Patch compileSdk (SDL-java BLUETOOTH_CONNECT)
+        run: |
+          # SDL-java из ddnet-libs (SDL 2.0.18+) использует константу
+          # android.Manifest.permission.BLUETOOTH_CONNECT, которая появилась
+          # только в API 31. Если android-проект собирается против compileSdk
+          # < 31 (старые DDNet 16.x/17.x или рассогласование версии), javac
+          # падает: "cannot find symbol: variable BLUETOOTH_CONNECT".
+          # Лечится поднятием compileSdk до 31. targetSdk НЕ трогаем,
+          # иначе для targetSdk 31+ манифест потребует android:exported.
+          HID=ddnet-libs/sdl/java/org/libsdl/app/HIDDeviceManager.java
+          BG=scripts/android/files/build.gradle
+          if [ -f "$HID" ] && grep -q BLUETOOTH_CONNECT "$HID"; then
+            if [ ! -f "$BG" ]; then
+              echo "::warning::$BG не найден — патч compileSdk пропущен"
+              exit 0
+            fi
+            CUR=$(grep -m1 -oE 'compileSdk(Version)?[[:space:]]+[0-9]+' "$BG" | grep -oE '[0-9]+' || true)
+            if [ -n "$CUR" ] && [ "$CUR" -lt 31 ]; then
+              sed -i -E 's/compileSdk(Version)?[[:space:]]+[0-9]+/compileSdkVersion 31/' "$BG"
+              echo "::notice::compileSdk $CUR -> 31: BLUETOOTH_CONNECT требует API 31 (SDL-java)"
+              grep -n 'compileSdk' "$BG" | head -3
+            else
+              echo "compileSdk=${CUR:-unknown} — BLUETOOTH_CONNECT доступен, патч не нужен"
+            fi
+          else
+            echo "SDL-java без BLUETOOTH_CONNECT — патч не нужен"
+          fi
+
+      - name: Patch FindCrypto (boringssl prebuilts для 16.x/17.x)
+        run: |
+          # DDNet 16.x/17.x: cmake/FindCrypto.cmake на android ищет крипту в
+          # ddnet-libs/openssl/ и требует заголовки openssl/opensslconf.h +
+          # openssl/configuration.h. ddnet-libs по актуальным пинам содержит
+          # BoringSSL: ddnet-libs/boringssl/android/libarm64/{libcrypto,libssl}.a
+          # и заголовки в boringssl/include/<TARGET_OS>/openssl/. Файла
+          # configuration.h у BoringSSL НЕТ (это OpenSSL 3.x), поэтому
+          # find_path переводим на ssl.h/base.h/hkdf.h/opensslconf.h — как в
+          # FindCrypto DDNet 18+. Из OpenSSL-API 17.x использует только
+          # SHA256 (src/base/hash.cpp) — в BoringSSL он есть; libcurl.a с
+          # этого же пина собран против этого же boringssl -> линкуется чисто.
+          FC=cmake/FindCrypto.cmake
+          if [ ! -f "$FC" ]; then
+            echo "::warning::$FC не найден — патч FindCrypto пропущен"
+            exit 0
+          fi
+          if grep -q boringssl "$FC"; then
+            echo "FindCrypto уже на boringssl (DDNet 18+) — патч не нужен"
+            exit 0
+          fi
+          python3 - "$FC" <<'PYEOF'
+          import sys
+          p = sys.argv[1]
+          s = open(p, encoding="utf-8").read()
+          OLD1 = "set_extra_dirs_lib(CRYPTO openssl)"
+          NEW1 = "set_extra_dirs_lib(CRYPTO boringssl)"
+          OLD2 = "set_extra_dirs_include(CRYPTO openssl \"${CRYPTO_LIBRARY}\")"
+          NEW2 = "set_extra_dirs_include(CRYPTO boringssl \"${CRYPTO_LIBRARY}\")"
+          OLD3 = "  find_path(CRYPTO_INCLUDEDIR1 openssl/opensslconf.h\n    PATH_SUFFIXES CRYPTO\n    HINTS ${HINTS_CRYPTO_INCLUDEDIR} ${PC_CRYPTO_INCLUDEDIR} ${PC_CRYPTO_INCLUDE_DIRS}\n    PATHS ${PATHS_CRYPTO_INCLUDEDIR}\n    ${CROSSCOMPILING_NO_CMAKE_SYSTEM_PATH}\n  )\n  find_path(CRYPTO_INCLUDEDIR2 openssl/configuration.h\n    PATH_SUFFIXES CRYPTO\n    HINTS ${HINTS_CRYPTO_INCLUDEDIR} ${PC_CRYPTO_INCLUDEDIR} ${PC_CRYPTO_INCLUDE_DIRS}\n    PATHS ${PATHS_CRYPTO_INCLUDEDIR}\n    ${CROSSCOMPILING_NO_CMAKE_SYSTEM_PATH}\n  )\n  set(CRYPTO_INCLUDEDIR ${CRYPTO_INCLUDEDIR1} ${CRYPTO_INCLUDEDIR2})"
+          NEW3 = "  find_path(CRYPTO_INCLUDEDIR openssl/ssl.h openssl/base.h openssl/hkdf.h openssl/opensslconf.h\n    PATH_SUFFIXES CRYPTO\n    HINTS ${HINTS_CRYPTO_INCLUDEDIR} ${PC_CRYPTO_INCLUDEDIR} ${PC_CRYPTO_INCLUDE_DIRS}\n    PATHS ${PATHS_CRYPTO_INCLUDEDIR}\n    ${CROSSCOMPILING_NO_CMAKE_SYSTEM_PATH}\n  )"
+          n = 0
+          if OLD1 in s:
+              s = s.replace(OLD1, NEW1)
+              n = n + 1
+              print("FindCrypto: папка библиотек openssl -> boringssl — ok")
+          else:
+              print("::warning::FindCrypto: шаблон 1 (set_extra_dirs_lib) не найден")
+          if OLD2 in s:
+              s = s.replace(OLD2, NEW2)
+              n = n + 1
+              print("FindCrypto: папка заголовков openssl -> boringssl — ok")
+          else:
+              print("::warning::FindCrypto: шаблон 2 (set_extra_dirs_include) не найден")
+          if OLD3 in s:
+              s = s.replace(OLD3, NEW3)
+              n = n + 1
+              print("FindCrypto: find_path opensslconf.h+configuration.h -> ssl.h/base.h/hkdf.h/opensslconf.h — ok")
+          else:
+              print("::warning::FindCrypto: шаблон 3 (find_path) не найден")
+          open(p, "w", encoding="utf-8").write(s)
+          print("FindCrypto: применено замен %d/3" % n)
+          PYEOF
+
+      - name: Detect layout (LEGACY 16.x/17.x или modern 18+)
+        run: |
+          if [ -f scripts/android/files/gradle-wrapper.jar ]; then
+            LEGACY=1
+            echo "layout: LEGACY (плоский gradle-проект, как в DDNet 16.x/17.x)"
+          else
+            LEGACY=0
+            echo "layout: modern (files/gradle/wrapper + gradlew, как в DDNet 18+)"
+          fi
+          VN=$(grep -m1 '#define GAME_RELEASE_VERSION_INTERNAL' src/game/version.h | awk '{print $3}' | tr -d '"' | tr '_' '.' || true)
+          if [ -z "$VN" ]; then VN=$(grep -m1 -E '^#define[[:space:]]+GAME_RELEASE_VERSION[[:space:]]+"' src/game/version.h | sed -E 's/.*"([^"]*)".*/\1/' | tr '_' '.' || true); fi
+          if [ -z "$VN" ]; then VN="unknown"; fi
+          echo "LEGACY=$LEGACY" >> "$GITHUB_ENV"
+          echo "базовая версия DDNet: $VN"
+
+      - name: Fail-fast check (android project files)
+        run: |
+          missing=0
+          for f in CMakeLists.txt src/game/version.h scripts/android/cmake_android.sh; do
+            if [ ! -f "$f" ]; then echo "MISSING: $f"; missing=1; fi
+          done
+          if [ ! -d data ]; then echo "MISSING dir: data"; missing=1; fi
+          if [ "$LEGACY" = "1" ]; then
+            for f in \
+              scripts/android/files/build.sh \
+              scripts/android/files/build.gradle \
+              scripts/android/files/gradle-wrapper.jar \
+              scripts/android/files/gradle-wrapper.properties \
+              scripts/android/files/gradle.properties \
+              scripts/android/files/local.properties \
+              scripts/android/files/proguard-rules.pro \
+              scripts/android/files/settings.gradle \
+              scripts/android/files/AndroidManifest.xml \
+              scripts/android/files/java/tw/DDNet/NativeMain.java; do
+              if [ ! -f "$f" ]; then echo "MISSING: $f"; missing=1; fi
+            done
+          else
+            for f in \
+              scripts/android/download_android_sdk.sh \
+              scripts/android/generate_asset_integrity_index.py \
+              scripts/compile_libs/_build_common.sh \
+              scripts/android/files/build.sh \
+              scripts/android/files/build.gradle \
+              scripts/android/files/settings.gradle \
+              scripts/android/files/gradle.properties \
+              scripts/android/files/proguard-rules.pro \
+              scripts/android/files/AndroidManifest.xml \
+              scripts/android/files/gradlew \
+              scripts/android/files/gradle/wrapper/gradle-wrapper.jar \
+              scripts/android/files/gradle/wrapper/gradle-wrapper.properties \
+              scripts/android/files/java/org/ddnet/client/ClientActivity.java \
+              scripts/android/files/java/org/ddnet/client/ServerService.java; do
+              if [ ! -f "$f" ]; then echo "MISSING: $f"; missing=1; fi
+            done
+          fi
+          if [ ! -d scripts/android/files/res ]; then echo "MISSING dir: scripts/android/files/res"; missing=1; fi
+          if [ "$missing" = 1 ]; then
+            echo "::error::в сурсе нет файлов, нужных для android-сборки (см. MISSING выше)"
+            exit 1
+          fi
+          echo "android-проект: все файлы на месте (LEGACY=$LEGACY)"
+
+      - name: Patch android project (пакет com.altynekst.tapk)
+        run: |
+          if [ "$LEGACY" = "1" ]; then
+            echo "LEGACY: патчу build.sh/cmake_android.sh/build.gradle/local.properties под 17.x"
+            printf '%s' 'IyAtKi0gY29kaW5nOiB1dGYtOCAtKi0KIiIi0J/QsNGC0YfQuCBhbmRyb2lkLdC/0YDQvtC10LrRgtCwIERETmV0IDE2LngvMTcueCAoTEVHQUNZIGxheW91dCkg0L/QvtC0INC/0LDQutC10YIgY29tLmFsdHluZWtzdC50YXBrLgrQkiBDSSDRgNCw0LfQstC+0YDQsNGH0LjQstCw0LXRgtGB0Y8g0LjQtyBiYXNlNjQg0Lgg0LfQsNC/0YPRgdC60LDQtdGC0YHRjyBweXRob24zLiIiIgppbXBvcnQgaW8KCmRlZiBwYXRjaChwYXRoLCBwYWlycyk6CiAgICB0cnk6CiAgICAgICAgcyA9IGlvLm9wZW4ocGF0aCwgZW5jb2Rpbmc9InV0Zi04IikucmVhZCgpCiAgICBleGNlcHQgT1NFcnJvciBhcyBlOgogICAgICAgIHByaW50KCI6OmVycm9yOjrQvdC1INC+0YLQutGA0YvRgtGMICVzOiAlcyIgJSAocGF0aCwgZSkpCiAgICAgICAgcmFpc2UgU3lzdGVtRXhpdCgxKQogICAgZm9yIG9sZCwgbmV3LCBsYWJlbCBpbiBwYWlyczoKICAgICAgICBpZiBvbGQgaW4gczoKICAgICAgICAgICAgcyA9IHMucmVwbGFjZShvbGQsIG5ldykKICAgICAgICAgICAgcHJpbnQoItC/0LDRgtGHICVzOiAlcyDigJQgb2siICUgKHBhdGgsIGxhYmVsKSkKICAgICAgICBlbHNlOgogICAgICAgICAgICBwcmludCgiOjp3YXJuaW5nOjrQsiAlcyDQvdC1INC90LDQudC00LXQvdC+ICglcyk6ICVyIiAlIChwYXRoLCBsYWJlbCwgb2xkWzo3MF0pKQogICAgaW8ub3BlbihwYXRoLCAidyIsIGVuY29kaW5nPSJ1dGYtOCIpLndyaXRlKHMpCgpwYXRjaCgic2NyaXB0cy9hbmRyb2lkL2ZpbGVzL2J1aWxkLnNoIiwgWwogICAgKCdfUkVQTEFDRV9QQUNLQUdFX05BTUVfU1RSPSJ0dy4kezIsLH0iJywKICAgICAnX1JFUExBQ0VfUEFDS0FHRV9OQU1FX1NUUj0iY29tLmFsdHluZWtzdC50YXBrIicsCiAgICAgItC/0LDQutC10YIgLT4gY29tLmFsdHluZWtzdC50YXBrIiksCiAgICAoJ212IHNyYy9tYWluL2phdmEvdHcvREROZXQgc3JjL21haW4vamF2YS90dy8iJHsyfSInLAogICAgICdta2RpciAtcCBzcmMvbWFpbi9qYXZhL2NvbS9hbHR5bmVrc3QgJiYgbXYgc3JjL21haW4vamF2YS90dy9ERE5ldCBzcmMvbWFpbi9qYXZhL2NvbS9hbHR5bmVrc3QvdGFwaycsCiAgICAgIm12INGBIG1rZGlyIC1wIChjb20vYWx0eW5la3N0L3RhcGspIiksCiAgICAoJ3NyYy9tYWluL2phdmEvdHcvIiR7Mn0iL05hdGl2ZU1haW4uamF2YScsCiAgICAgJ3NyYy9tYWluL2phdmEvY29tL2FsdHluZWtzdC90YXBrL05hdGl2ZU1haW4uamF2YScsCiAgICAgItC/0YPRgtGMIE5hdGl2ZU1haW4uamF2YSIpLAogICAgKCdzZWQgLWkgInMvXFwiREROZXRcXCIvXFwiJHsyfVxcIi9nIiBzcmMvbWFpbi9BbmRyb2lkTWFuaWZlc3QueG1sJywKICAgICAndHJ1ZSAjIGxpYl9uYW1lINC+0YHRgtCw0ZHRgtGB0Y8gREROZXQg4oCUINC90LDRgtC40LLQvdCw0Y8g0LvQuNCx0LAgbGliREROZXQuc28nLAogICAgICLQvdC1INC70L7QvNCw0YLRjCBhbmRyb2lkOnZhbHVlPWxpYl9uYW1lIiksCiAgICAoJ29yZy5ncmFkbGUud3JhcHBlci5HcmFkbGVXcmFwcGVyTWFpbiAtLXdhcm5pbmctbW9kZSBhbGwgYnVpbGRyZWxlYXNlJywKICAgICAnb3JnLmdyYWRsZS53cmFwcGVyLkdyYWRsZVdyYXBwZXJNYWluIC0td2FybmluZy1tb2RlIGFsbCBoZWxwJywKICAgICAiYnVpbGRyZWxlYXNlINC90LUg0YHRg9GJ0LXRgdGC0LLRg9C10YIg0LIgYnVpbGQuZ3JhZGxlIDE3LjQuMiAtPiBoZWxwIiksCiAgICAoJ29yZy5ncmFkbGUud3JhcHBlci5HcmFkbGVXcmFwcGVyTWFpbiAtLXdhcm5pbmctbW9kZSBhbGwgYnVpbGRkZWJ1ZycsCiAgICAgJ29yZy5ncmFkbGUud3JhcHBlci5HcmFkbGVXcmFwcGVyTWFpbiAtLXdhcm5pbmctbW9kZSBhbGwgaGVscCcsCiAgICAgImJ1aWxkZGVidWcg0L3QtSDRgdGD0YnQtdGB0YLQstGD0LXRgiDQsiBidWlsZC5ncmFkbGUgMTcuNC4yIC0+IGhlbHAiKSwKXSkKcGF0Y2goInNjcmlwdHMvYW5kcm9pZC9jbWFrZV9hbmRyb2lkLnNoIiwgWwogICAgKCdjbWFrZSAtLWJ1aWxkIC4gLS10YXJnZXQgREROZXQnLAogICAgICdjbWFrZSAtLWJ1aWxkIC4gLS10YXJnZXQgZ2FtZS1jbGllbnQnLAogICAgICfRhtC10LvRjCBnYW1lLWNsaWVudCAo0LIgMTcueCDQv9C10YDQtdC40LzQtdC90L7QstCw0L3QsCDQuNC3IERETmV0KScpLAogICAgKCctREFORFJPSURfQVJNX05FT049VFJVRSBcXCcsCiAgICAgJy1EQU5EUk9JRF9BUk1fTkVPTj1UUlVFIFxcXG5cdFx0XHQtRENNQUtFX1JVU1RfQ09NUElMRVJfVEFSR0VUPWFhcmNoNjQtbGludXgtYW5kcm9pZCBcXCcsCiAgICAgJ3J1c3Qt0LrRgNC+0YHRgSBhYXJjaDY0LWxpbnV4LWFuZHJvaWQnKSwKICAgICgnd2FpdFxuXG5wcmludGYgIlxcZVszNm1QcmVwYXJpbmcgZ3JhZGxlIGJ1aWxkXFxuIicsCiAgICAgJ3dhaXRcblxuIyBULWFwayBDSTog0LXRgdC70Lgg0L3QsNGC0LjQstC90LDRjyDRgdCx0L7RgNC60LAg0L3QtSDQtNCw0LvQsCBsaWJERE5ldC5zbyDigJQg0LLRi9GF0L7QtNC40Lwg0JTQniBncmFkbGUsXG4jINC40L3QsNGH0LUgZ3JhZGxlINC80L7Qu9GH0LAg0YHQvtCx0LjRgNCw0LXRgiBBUEsg0LHQtdC3INC90LDRgtC40LLQvdGL0YUg0LHQuNCx0LvQuNC+0YLQtdC6XG5mb3IgZCBpbiBidWlsZF9hbmRyb2lkL2J1aWxkX2FyY2gvKjsgZG9cblx0XHRpZiBbICEgLWYgIiRkL2xpYkRETmV0LnNvIiBdOyB0aGVuXG5cdFx0XHRwcmludGYgIlxcZVszMW1FUlJPUjogbmF0aXZlIGJ1aWxkIGZvciAlcyBkaWQgbm90IHByb2R1Y2UgbGliREROZXQuc28gKNGB0LwuINC+0YjQuNCx0LrQuCBjbWFrZS9uaW5qYSDQstGL0YjQtSlcXGVbMzBtXFxuIiAiJGQiXG5cdFx0XHRmaW5kIGJ1aWxkX2FuZHJvaWQgLW5hbWUgbGliREROZXQuc28gMj4vZGV2L251bGwgfCBoZWFkIC01XG5cdFx0XHRleGl0IDFcblx0XHRmaVxuZG9uZVxuXG5wcmludGYgIlxcZVszNm1QcmVwYXJpbmcgZ3JhZGxlIGJ1aWxkXFxuIicsCiAgICAgJ2ZhaWwtZmFzdDog0L3QtdGCIGxpYkRETmV0LnNvIC0+IGV4aXQg0LTQviBncmFkbGUnKSwKICAgICgnXHRjcCAiJF9BTkRST0lEX1NVQl9CVUlMRF9ESVIvJDEvbGliREROZXQuc28iICJsaWIvJDIiXG5cdGNwICIkX0FORFJPSURfU1VCX0JVSUxEX0RJUi8kMS9saWJzL2xpYlNETDIuc28iICJsaWIvJDIiXG5cdGNwICIkX0FORFJPSURfU1VCX0JVSUxEX0RJUi8kMS9saWJzL2xpYmhpZGFwaS5zbyIgImxpYi8kMiInLAogICAgICdcdGNwICIkX0FORFJPSURfU1VCX0JVSUxEX0RJUi8kMS9saWJERE5ldC5zbyIgImxpYi8kMiJcblx0IyBULWFwayBDSTogU0RML2hpZGFwaSDQstGI0LjRgtGLINCyIGxpYkRETmV0LnNvINGB0YLQsNGC0LjRh9C10YHQutC4IChOYXRpdmVNYWluINCz0YDRg9C30LjRglxuXHQjINGC0L7Qu9GM0LrQviBERE5ldCksINC+0YLQtNC10LvRjNC90YvRhSBsaWJzL2xpYlNETDIuc28g0LzQvtC20LXRgiDQvdC1INCx0YvRgtGMIOKAlCDRjdGC0L4g0L3QtSDQvtGI0LjQsdC60LBcblx0Y3AgIiRfQU5EUk9JRF9TVUJfQlVJTERfRElSLyQxL2xpYnMvbGliU0RMMi5zbyIgImxpYi8kMiIgMj4vZGV2L251bGwgfHwgdHJ1ZVxuXHRjcCAiJF9BTkRST0lEX1NVQl9CVUlMRF9ESVIvJDEvbGlicy9saWJoaWRhcGkuc28iICJsaWIvJDIiIDI+L2Rldi9udWxsIHx8IHRydWUnLAogICAgICdjb3B5X2xpYnMg0YLQvtC70LXRgNCw0L3RgtC10L0g0Log0L7RgtGB0YPRgtGB0YLQstC40Y4gbGlicy8qLnNvJyksCl0pCnBhdGNoKCJzY3JpcHRzL2FuZHJvaWQvZmlsZXMvYnVpbGQuZ3JhZGxlIiwgWwogICAgKCJhcHBseSBwbHVnaW46ICdrb3RsaW4tYW5kcm9pZCciLAogICAgICIvLyBrb3RsaW4g0L7RgtC60LvRjtGH0ZHQvSAo0LIgMjAyNiAnKycg0YLRj9C90LXRgiBLR1AgMi54LCDQvdC10YHQvtCy0LzQtdGB0YLQuNC80YvQuSDRgSBBR1AgNy4yLjEpIiwKICAgICAia290bGluIHBsdWdpbiBvZmYiKSwKICAgICgnY2xhc3NwYXRoICJvcmcuamV0YnJhaW5zLmtvdGxpbjprb3RsaW4tZ3JhZGxlLXBsdWdpbjoka290bGluX3ZlcnNpb24iJywKICAgICAiLy8ga290bGluIGNsYXNzcGF0aCBvZmYiLAogICAgICJrb3RsaW4gY2xhc3NwYXRoIG9mZiIpLAogICAgKCJleHQua290bGluX3ZlcnNpb24gPSAnKyciLAogICAgICIiLAogICAgICJrb3RsaW4gZXh0IG9mZiIpLAogICAgKCdpbXBsZW1lbnRhdGlvbiAib3JnLmpldGJyYWlucy5rb3RsaW46a290bGluLXN0ZGxpYi1qZGs3OiRrb3RsaW5fdmVyc2lvbiInLAogICAgICIvLyBrb3RsaW4gc3RkbGliIG9mZiIsCiAgICAgImtvdGxpbiBzdGRsaWIgb2ZmIiksCl0pCnBhdGNoKCJzY3JpcHRzL2FuZHJvaWQvZmlsZXMvbG9jYWwucHJvcGVydGllcyIsIFsKICAgICgnc2RrLmRpcj0iVFdfSE9NRV9ESVIvQW5kcm9pZC9TZGsiJywKICAgICAic2RrLmRpcj0vaG9tZS9ydW5uZXIvQW5kcm9pZC9TZGsiLAogICAgICJzZGsuZGlyINCw0LHRgdC+0LvRjtGC0L3Ri9C5INCx0LXQtyDQutCw0LLRi9GH0LXQuiIpLApdKQpwcmludCgiTEVHQUNZLdC/0LDRgtGH0Lgg0L/RgNC40LzQtdC90LXQvdGLIikK' | base64 -d > /tmp/patch_legacy.py
+            python3 /tmp/patch_legacy.py
+          else
+            if grep -q 'mv src/main/java/org/ddnet/client' scripts/android/files/build.sh; then
+              if grep -q 'mkdir -p "src/main/java/$(dirname' scripts/android/files/build.sh; then
+                echo "build.sh: mv-патч уже стоит"
+              else
+                sed -i 's|mv src/main/java/org/ddnet/client src/main/java/"${APK_PACKAGE_FOLDER}"|mkdir -p "src/main/java/$(dirname "${APK_PACKAGE_FOLDER}")" \&\& mv src/main/java/org/ddnet/client src/main/java/"${APK_PACKAGE_FOLDER}"|' scripts/android/files/build.sh
+                if grep -q 'mkdir -p "src/main/java/$(dirname' scripts/android/files/build.sh; then
+                  echo "build.sh: mv-патч применён (mkdir -p && mv)"
+                else
+                  echo "::warning::mv-патч не применился: строка mv отличается от эталона DDNet 19.8.2"
+                fi
+              fi
+            else
+              echo "::warning::mv в build.sh не найден — форк, возможно, уже чинил это"
+            fi
+          fi
+
+      - name: Icon stub (other/icons/DDNet_256x256x32.png)
+        run: |
+          if [ ! -f other/icons/DDNet_256x256x32.png ]; then
+            echo "::warning::other/icons/DDNet_256x256x32.png нет — кладу заглушку"
+            mkdir -p other/icons
+            printf '%s' 'iVBORw0KGgoAAAANSUhEUgAAAQAAAAEACAYAAABccqhmAAACYUlEQVR42u3UMQEAAAQAQcEEkUhtCmjghivww0d1DvBTiAAGABgAYACAAQAGABgAYACAAQAGABgAYACAAQAGABgAYACAAQAGABgAYACAAQAGABgAYACAAQAGABgAYACAAQAGABgAYACAAQAGABgAYACAAYABiAAGABgAYACAAQAGABgAYACAAQAGABgAYACAAQAGABgAYACAAQAGABgAYACAAQAGABgAYACAAQAGABgAYACAAQAGABgAYACAAQAGABgAYACAAYABiAAGABgAYACAAQAGABgAYACAAQAGABgAYACAAQAGABgAYACAAQAGABgAYACAAQAGABgAYACAAQAGABgAYACAAQAGABgAYACAAQAGABgAYACAAYABCAEGABgAYACAAQAGABgAYACAAQAGABgAYACAAQAGABgAYACAAQAGABgAYACAAQAGABgAYACAAQAGABgAYACAAQAGABgAYACAAQAGABgAYACAAYABAAYAGABgAIABAAYAGABgAIABAAYAGABgAIABAAYAGABgAIABAAYAGABgAIABAAYAGABgAIABAAYAGABgAIABAAYAGABgAIABAAYAGABgAIABgAEABgAYAGAAgAEABgAYAGAAgAEABgAYAGAAgAEABgAYAGAAgAEABgAYAGAAgAEABgAYAGAAgAEABgAYAGAAgAEABgAYAGAAgAEABgAYAGAAgAGAAQAGABgAYACAAQAGABgAYACAAQAGABgAYACAAQAGABgAYACAAQAGABgAYACAAQAGABgAYACAAQAGABgAYACAAQAGABgAYACAAQCXBeFBH3glkSTOAAAAAElFTkSuQmCC' | base64 -d > other/icons/DDNet_256x256x32.png
+          fi
+
       - name: Prepare Linux
         run: |
           sudo apt-get update -y -o Acquire::Retries=5
@@ -171,27 +531,44 @@ jobs:
           curl -fL --retry 5 --retry-delay 5 --retry-all-errors --connect-timeout 30 -o cmake.tar.gz https://github.com/Kitware/CMake/releases/download/v3.22.1/cmake-3.22.1-Linux-x86_64.tar.gz
           mkdir -p /home/runner/cmake
           tar --strip-components 1 -C /home/runner/cmake -xf cmake.tar.gz
-          # файлы из тарболла могут прийти без бита исполнения — чиним
           find scripts -name '*.sh' -exec chmod +x {} +
-          chmod +x scripts/android/files/gradlew
+          rustup install 1.92.0 --profile minimal
           rustup default 1.92.0
           export CARGO_NET_RETRY=10
           export CARGO_HTTP_TIMEOUT=120
           rustup target add aarch64-linux-android
-          cargo install cargo-ndk
-          sdk_ok=0
-          for i in 1 2 3; do
-            if bash scripts/android/download_android_sdk.sh /home/runner; then sdk_ok=1; break; fi
-            echo "попытка $i не удалась — чищу /home/runner/Android/Sdk и повторяю через 20 сек"
-            rm -rf /home/runner/Android/Sdk
-            sleep 20
-          done
-          if [ "$sdk_ok" != 1 ]; then
-            echo "::error::download_android_sdk.sh не отработал за 3 попытки"
-            exit 1
+          if [ "$LEGACY" = "1" ]; then
+            echo "LEGACY: ставлю SDK сам (в 17.x нет download_android_sdk.sh): cmdline-tools + platform-30 + build-tools 30.0.3 + NDK r27c"
+            mkdir -p /home/runner/Android/Sdk/cmdline-tools /home/runner/Android/Sdk/ndk
+            curl -fL --retry 5 --retry-delay 5 --retry-all-errors --connect-timeout 30 -o /tmp/clt.zip https://dl.google.com/android/repository/commandlinetools-linux-13114758_latest.zip
+            rm -rf /tmp/clt_x && mkdir -p /tmp/clt_x && unzip -q /tmp/clt.zip -d /tmp/clt_x
+            rm -rf /home/runner/Android/Sdk/cmdline-tools/latest
+            mv /tmp/clt_x/cmdline-tools /home/runner/Android/Sdk/cmdline-tools/latest
+            yes 2>/dev/null | /home/runner/Android/Sdk/cmdline-tools/latest/bin/sdkmanager --licenses >/dev/null || true
+            /home/runner/Android/Sdk/cmdline-tools/latest/bin/sdkmanager --install "platform-tools" "platforms;android-30" "platforms;android-31" "build-tools;30.0.3" >/tmp/sdkmgr.log 2>&1 || { tail -30 /tmp/sdkmgr.log; echo "::error::sdkmanager не установил компоненты"; exit 1; }
+            curl -fL --retry 5 --retry-delay 5 --retry-all-errors --connect-timeout 30 -o /tmp/ndk.zip https://dl.google.com/android/repository/android-ndk-r27c-linux.zip
+            rm -rf /tmp/ndk_x && mkdir -p /tmp/ndk_x && unzip -q /tmp/ndk.zip -d /tmp/ndk_x
+            rm -rf /home/runner/Android/Sdk/ndk/27.2.12479018
+            mv /tmp/ndk_x/android-ndk-r27c /home/runner/Android/Sdk/ndk/27.2.12479018
+            echo "NDK: $(ls /home/runner/Android/Sdk/ndk)"
+            echo "SDK: $(ls /home/runner/Android/Sdk/platforms /home/runner/Android/Sdk/build-tools)"
+          else
+            chmod +x scripts/android/files/gradlew || true
+            export HOST_OS=linux
+            cargo install cargo-ndk
+            sdk_ok=0
+            for i in 1 2 3; do
+              if bash scripts/android/download_android_sdk.sh /home/runner; then sdk_ok=1; break; fi
+              echo "попытка $i не удалась — чищу /home/runner/Android/Sdk и повторяю через 20 сек"
+              rm -rf /home/runner/Android/Sdk
+              sleep 20
+            done
+            if [ "$sdk_ok" != 1 ]; then
+              echo "::error::download_android_sdk.sh не отработал за 3 попытки"
+              exit 1
+            fi
+            echo "NDK: $(ls /home/runner/Android/Sdk/ndk)"
           fi
-          echo "NDK: $(ls /home/runner/Android/Sdk/ndk)"
-          echo "SDK: $(ls /home/runner/Android/Sdk | tr '\n' ' ')"
 
       - name: Install Vulkan SDK
         uses: humbletim/install-vulkan-sdk@v1.2
@@ -199,57 +576,131 @@ jobs:
           version: 1.3.296.0
           cache: true
 
-      - name: Build Android app (arm64-v8a, пакет com.altynekst.tapk)
+      - name: Install JDK 11 (gradle 7.4.2 + AGP 7.2.1 в LEGACY)
+        if: env.LEGACY == '1'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '11'
+
+      - name: Build Android app (arm64-v8a only)
         run: |
           export TW_KEY_NAME=/home/runner/T-apk.jks
           export TW_KEY_ALIAS=Tapk-Key
           export TW_KEY_PW="TapkSign2026"
-          # ПОСТОЯННЫЙ ключ подписи (вшит в скрипт): одна и та же подпись во
-          # всех сборках -> обновление ставится ПОВЕРХ предыдущего БЕЗ
-          # удаления, данные игры (настройки/демо) не стираются.
+          # ПОСТОЯННЫЙ ключ подписи (вшит в скрипт): одна и та же подпись во всех
+          # сборках -> обновление ставится ПОВЕРХ предыдущего БЕЗ удаления,
+          # данные игры (настройки/демо) не стираются между сборками.
           printf '%s' 'MIIKSAIBAzCCCfIGCSqGSIb3DQEHAaCCCeMEggnfMIIJ2zCCBbIGCSqGSIb3DQEHAaCCBaMEggWfMIIFmzCCBZcGCyqGSIb3DQEMCgECoIIFQDCCBTwwZgYJKoZIhvcNAQUNMFkwOAYJKoZIhvcNAQUMMCsEFEhoM9UX00BVbTaHArnBQ9QOlK8mAgInEAIBIDAMBggqhkiG9w0CCQUAMB0GCWCGSAFlAwQBKgQQYQFKGDTlfhO/OeHoQ9+coASCBNCsXj+axQIsODynHnHqGGuGGVZtutR2IVTTBjXf2PJNbJ7rEnDu7t/eQSRRzXyAR9DfgvllAZDu/Ycm9JYTpMvK4rTIgCjO7j9D08YcnqeOVv9Pzxoe1FFiqyLFGUZe16IHzeBvO8iB/6ReJQdqLYE4Vw6GQ9iD1LRfdxUwruDwKBNsTn8lT2Zl4WDpwEVkqzJXzrIm+nRAYxOfwotjOQwjMh6sSdgSSjSPE0ZJh6qdi0j916qDVpV8b1tXyAEItEXeraPlJ0exlxlezRB6cBfYIBd1o0wLPakD9PSqYmeHOApVqKEGRoiiEyyJIYZ38CoSjmpdt70tuj6X91l0rv1IXABCUXMKyLcb2eZCfoXg61ubYLeazNB7PcwEtsqPHY1gNHDzOB70ApWUneFl/RO70p1cBGxSvFjqXSelBj+CnVQ0Iy7bZ+kxBr5LEMovg+HY9lD3WosGxzW65h4Oq3yZqGXy/NsKs3CGHt0SaBm1pwp0caBJTxGQGV+9MiVVqB/Q3Dz3FYV/go8kC/rJsPi8+XvDnU9tXfhkLllgMEmmsObw6JskaX//ahy1e5128goK/lxuOVYutSg7BD30IOMlue0x8pyuKOHx2TAiGlC/h7j6a8LYrS/rdor2EbiwlTJp+TSDDTTGnXv6KnITFBRt+WIeXZICSBJqpdvl7aYq2XzMFGxUHymIRuFnUmXgFfq1J4IvpJlzGYmtd/g3BuIklZWmRU1b1pk6dq+1NbLwGqXy0MMH8VUhiqvUQuUhMDvQFAqvo5ONMsMWc04F/E6Ub9t1XgLc7ulNXiVYr1Mmp2LutJxufz+NFyLzt4fjVbd2a9eB4KtjtaaLA3yynquRy4N95ZQDwPakkUIcSHwlk1bvN5Lnkabc9/zx08kyT+5sf1gmT39qdirODGa6ArLVKPYBYd91Zjju076r1S2YFXvzfSqwTDtRF5Yx9smxW97B0inT7+q9i+SA7Ftg6QvOxoBqghNMSJO/Ru9dNqNatsgMr3/9VEgUDyEnX2M0zvPDQn7I5I4tATXpV8RfI4SliK4hyxitj7DitEtOS5TEYfxJPfRgZ0r5Bof4H1EPbNdp37Hd4j6BVH2RVhHKsvNaRJEc2+bGwn5VTgugee/pSiL3xzSFq2kc8NHH0h9XqEiPpsAZYzu/X8/wqKjP0b14jnF4AwUwqdx/EoHKmdJQpEnSYV1fM0w4Ki3Av5NzmBmNiseQMf6YSSJWMWFOTbV+agrqcbBeocSaEjH7wEr0E6HqWa293ijEyeA2zS9gS4dKl8ZG5DCtayQW0uZ6xG4drhAqvxSkeYq2cc21RoRwA/ohyB5ady2Cmbfn+LI5m6h8c6n5jNBTMTdxY3TE9SfTF+zN76qd5Q7ksYjnhjZ23FGuUJENRTTj7Jn1HknFL4Ylu9Dpo5QCDM9tXxKTGjI7o0gdKZXyrx+c2kn91CKKAFJhZo0OAtmm8G8vHw9dtenU0NE+ZnebDQv5mHNJZ1L6InX3U/HioibphaK9zjDNsNKmoodMSOtwqr2C4m8KDqjPBCij6uLIE+QYDepXCcog1YVAq+j+pPM6fACWu/ZjtmBS4bdBEVu3esLzQHXamWLTgcXDqCGx8Ita1EZlp8dhMWvYm9E1kkoSFiy4khIebzFEMB8GCSqGSIb3DQEJFDESHhAAdABhAHAAawAtAGsAZQB5MCEGCSqGSIb3DQEJFTEUBBJUaW1lIDE3OTUwMTAyNjA0MzMwggQhBgkqhkiG9w0BBwagggQSMIIEDgIBADCCBAcGCSqGSIb3DQEHATBmBgkqhkiG9w0BBQ0wWTA4BgkqhkiG9w0BBQwwKwQUzSc8zqRv8ZgbDAeKyDhgEugH3UMCAicQAgEgMAwGCCqGSIb3DQIJBQAwHQYJYIZIAWUDBAEqBBBr2mBeRQ499m1QHbtuCWZbgIIDkAx+E4HYFLK4RBVyc0verTom3gZi8KJkyatvFJPLs/FUSyonLZhagQxEMVXc7aqQYg9reFNxo7sQjVXZOpn3+r25q4NRM7SH5vyLjcV2Ktq/QTnaTKcpbCZzUlrr5nIGUSoxFrGGZ5ud483QVRSDhFGDp0tfOp8+C9RZckVhmUE6r0LTWoXLB9eS9dIZh0ZHLqI0f8J40vJK+B6rKUzYiz1ZbUGhAPWFbM7Lzl1AnZMyMOFpIf3DRZon3+C+6/MMFS+4yJfl23WYCB1p71USmonw7WpIpyfjbLZ5mPM22T3jz7b44xRsyPWW7qdo1bhq0e8S0l5Q2/9EXn25qmMN0TPNq2F7pafvuQPTzHiq+mO0zsIVzTweP3omSq6C5EYvOaP0JiiJue816oWHlKYsfDkCyZFtCSCJ40LT9VtJGJMBFjbB5xNKk3Y9/xdNPl46SA4teOsxQmpCpXm7PtIlMgj6TeHwrdIfcD9aHbqxdWdjD9UTx0nSQuiaChgm5CK4+S9dd+zXLFyME5sIuLb563/YV+73cGqrVoslrkSj7gZ0uqQOYZ8yTlmWetI4PffvfzJ80ZLotLgm5t8+YPqo1BV722EuoorlgdvBNMdK/M8l70gY29pxc3MhbdbO7gAK01lLRwYqn8jFzmcffwnWYuurbB+WfrSDxjdDsSVqXQzm21lkZC4qGCYsaRJqgDUIrKRjXZT6UcTr7gQmRhlVK5tU9/vYMQqP7fB0i9DcPE5nyk4H7h3Oq4FQeBupyVoxYpmCSa/G0k69KpfBY8yexEaLJCTxLU3ufWw0exsrEHMhqM2J+gQorqaADyGaRW3wTr/WApJ4FwDvb8vI4Tt3rJZ1IBk/zoGeAir3tDQtRy3ntEVSNLqFDAeSsze4rebK54T75x04gQkAU1+kw1bYUNBp3a0PBLNMuMdFzOo0AFY2hH3zs4QBQI+6NhUw/x8JMvDuwjN0eHrYXg7tYNx+mb/IMfBOmFUYGRMAxBFwQrEV53IqGYbr7vDidQRh+L6TYY7GA7SyngMBPuGew7Jp71Fk6gyvWR+jN8GXf7Xwxx+PmeyPbJABXjBI7hhUI6W4xelXQ9fL7dxREGHj7Uymy1PTwmfTKic4vBB492vc6N9MnkhNWvOAIuboyfvuhSkIYtE4xb84sREPZe84H/Me7RzxeNX5suGh3+w/wZU89JtjsXmKnNuH9pNZGquq3JriXjBNMDEwDQYJYIZIAWUDBAIBBQAEILiaSCggbn1y5Q5vTPajvouIwgYgjsjplddxD+TCJF3KBBTVVB721+cbmrZNGSkvEfhxpwaeaQICJxA=' | base64 -d > "$TW_KEY_NAME"
           keytool -list -keystore "$TW_KEY_NAME" -storepass "$TW_KEY_PW" >/dev/null 2>&1 || { echo "::error::вшитый keystore не читается"; exit 1; }
           echo "подпись: постоянный keystore CN=T-apk (alias $TW_KEY_ALIAS)"
           export ANDROID_HOME="/home/runner/Android/Sdk"
-          unset ANDROID_SDK_ROOT
-          export PATH=/home/runner/cmake/bin:$PATH
+          export ANDROID_SDK_ROOT="/home/runner/Android/Sdk"
           if [ -n "${VULKAN_SDK:-}" ]; then export PATH="$VULKAN_SDK/bin:$PATH"; fi
           if ! command -v glslangValidator >/dev/null 2>&1 && ! command -v glslang >/dev/null 2>&1; then
             echo "::error::glslangValidator не найден — без него не собрать Vulkan-шейдеры"
             exit 1
           fi
-          if [ ! -d /home/runner/Android/Sdk/ndk ]; then
-            echo "::error::NDK не найден в /home/runner/Android/Sdk/ndk — download_android_sdk.sh не отработал?"
-            exit 1
-          fi
-          echo "JAVA: $(java -version 2>&1 | head -1) | NDK: $(ls /home/runner/Android/Sdk/ndk)"
-          # versionName/versionCode cmake_android.sh берёт сам из
-          # src/game/version.h (20.2.1 / DDNET_VERSION_NUMBER) — versionCode
-          # растёт относительно прошлых сборок, обновления ставятся.
+          VN=$(grep -m1 '#define GAME_RELEASE_VERSION_INTERNAL' src/game/version.h | awk '{print $3}' | tr -d '"' | tr '_' '.' || true)
+          if [ -z "$VN" ]; then VN=$(grep -m1 -E '^#define[[:space:]]+GAME_RELEASE_VERSION[[:space:]]+"' src/game/version.h | sed -E 's/.*"([^"]*)".*/\1/' | tr '_' '.' || true); fi
+          if [ -z "$VN" ]; then VN="1.0"; fi
+          export TW_VERSION_NAME="$VN"
+          VC=$(grep -m1 '#define DDNET_VERSION_NUMBER' src/game/version.h | awk '{print $3}' || true)
+          if [ -z "$VC" ]; then VC="${GITHUB_RUN_NUMBER}"; fi
+          export TW_VERSION_CODE="$VC"
           mkdir -p artifacts
-          echo "Сборка: Nullcki (DDNet 20.2.1 + NullClient + KRX) | APK T-apk | пакет com.altynekst.tapk | arm64-v8a"
-          bash scripts/android/cmake_android.sh arm64 "T-apk" com.altynekst.tapk Release build-android-release
-          APK=$(find build-android-release -maxdepth 1 -name '*.apk' | head -1)
-          if [ -z "$APK" ]; then
-            echo "в корне build-android-release APK нет — ищу в глубине"
-            APK=$(find build-android-release -name '*.apk' | head -1)
-          fi
-          if [ -z "$APK" ]; then
-            echo "::error::APK не найден в build-android-release — см. вывод gradle выше"
-            find build-android-release -name '*.apk' || true
-            exit 1
+          if [ "$LEGACY" = "1" ]; then
+            export PATH=/home/runner/cmake/bin:$PATH
+            export ANDROID_NDK_HOME="/home/runner/Android/Sdk/ndk/27.2.12479018"
+            if [ ! -f "$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" ]; then
+              echo "::error::NDK r27c не найден в $ANDROID_NDK_HOME"
+              exit 1
+            fi
+            # rust/cc-крейты: cargo build --target aarch64-linux-android —
+            # build-скрипты (cc, link-cplusplus, cxx) ищут компилятор через env
+            # CC/CXX/AR_<triple> (в bash дефисные имена не заexportить — задаём
+            # подчёркнутые, cc проверяет оба варианта) или «голый»
+            # aarch64-linux-android-clang++ в PATH. Без этого cargo падал:
+            # "Failed to find tool. Is aarch64-linux-android-clang++ installed?".
+            # NDK кладёт ABI-суффиксные обёртки; 24 = ANDROID_NATIVE_API_LEVEL
+            # из cmake_android.sh 17.4. «Голые» обёртки создаём симлинками
+            # (так же делает cargo-ndk).
+            NDK_BIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+            if [ ! -e "$NDK_BIN/aarch64-linux-android24-clang" ] || [ ! -e "$NDK_BIN/aarch64-linux-android24-clang++" ]; then
+              echo "::error::в NDK нет обёрток aarch64-linux-android24-clang(++): $NDK_BIN"
+              exit 1
+            fi
+            export PATH="$NDK_BIN:$PATH"
+            export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$NDK_BIN/aarch64-linux-android24-clang"
+            export CC_aarch64_linux_android="$NDK_BIN/aarch64-linux-android24-clang"
+            export CXX_aarch64_linux_android="$NDK_BIN/aarch64-linux-android24-clang++"
+            export AR_aarch64_linux_android="$NDK_BIN/llvm-ar"
+            for tool in clang clang++; do
+              if [ ! -e "$NDK_BIN/aarch64-linux-android-$tool" ]; then
+                ln -s "aarch64-linux-android24-$tool" "$NDK_BIN/aarch64-linux-android-$tool"
+              fi
+            done
+            echo "LEGACY-сборка: DDNet ${DDNET_VERSION:-17.4} | APK-имя T-apk | пакет com.altynekst.tapk (патч build.sh) | VN=$VN | VC=$VC"
+            echo "JAVA: $(java -version 2>&1 | head -1)"
+            bash scripts/android/cmake_android.sh arm64 "T-apk" Release
+            if [ ! -f build_android/lib/arm64-v8a/libDDNet.so ] && [ -f build_android/build_arch/arm64/libDDNet.so ]; then
+              echo "copy_libs не дошёл до lib/, но build_arch/arm64/libDDNet.so есть — копирую сам"
+              mkdir -p build_android/lib/arm64-v8a
+              cp build_android/build_arch/arm64/libDDNet.so build_android/lib/arm64-v8a/
+            fi
+            if [ ! -f build_android/lib/arm64-v8a/libDDNet.so ]; then
+              echo "::error::libDDNet.so не собрался/не скопировался (причина — в ошибках cmake/ninja ВЫШЕ по логу)"
+              echo "=== найденные .so: ==="
+              find build_android -maxdepth 4 -name '*.so' | head -20 || true
+              exit 1
+            fi
+            APK=$(find build_android -maxdepth 1 -name '*.apk' | head -1)
+            if [ -z "$APK" ]; then
+              echo "в корне build_android APK нет (cp в build.sh мог не сработать на нестандартном имени выхода) — ищу в глубине"
+              APK=$(find build_android -name '*.apk' | head -1)
+            fi
+            if [ -z "$APK" ]; then
+              echo "::error::APK не найден в build_android — см. вывод gradle выше"
+              exit 1
+            fi
+          else
+            unset ANDROID_SDK_ROOT
+            if [ -n "${JAVA_HOME_21_X64:-}" ]; then export JAVA_HOME="$JAVA_HOME_21_X64"; fi
+            export PATH=/home/runner/cmake/bin:$PATH
+            export ANDROID_NDK_HOME="/home/runner/Android/Sdk/ndk/29.0.14206865"
+            if [ ! -f "$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" ]; then
+              NDK_ALT=$(ls -d /home/runner/Android/Sdk/ndk/*/ 2>/dev/null | head -1 || true)
+              if [ -n "$NDK_ALT" ] && [ -f "${NDK_ALT}build/cmake/android.toolchain.cmake" ]; then
+                export ANDROID_NDK_HOME="${NDK_ALT%/}"
+              else
+                echo "::error::NDK не найден в /home/runner/Android/Sdk/ndk — download_android_sdk.sh не отработал?"
+                exit 1
+              fi
+            fi
+            export ANDROID_TOOLCHAIN_ROOT="$ANDROID_NDK_HOME"
+            echo "ANDROID_NDK_HOME=$ANDROID_NDK_HOME | JAVA_HOME=${JAVA_HOME:-default}"
+            GAME=$(grep -m1 '#define GAME_NAME' src/game/version.h | sed -n 's/^#define[[:space:]]*GAME_NAME[[:space:]]*"\([^"]*\)".*/\1/p' || true)
+            if [ -z "$GAME" ]; then GAME=$(grep -im1 '^[[:space:]]*project[[:space:]]*(' CMakeLists.txt | sed 's/^[^(]*project[[:space:]]*(//; s/[^A-Za-z0-9_-].*$//' || true); fi
+            if [ -z "$GAME" ]; then GAME=DDNet; fi
+            echo "GAME_NAME=$GAME | PACKAGE=com.altynekst.tapk | VERSION_NAME=$VN | VERSION_CODE=$VC"
+            bash scripts/android/cmake_android.sh arm64 "$GAME" com.altynekst.tapk Release build-android-release
+            APK=$(find build-android-release -maxdepth 2 -name '*.apk' | head -1)
+            if [ -z "$APK" ]; then
+              echo "::error::APK не найден в build-android-release"
+              find build-android-release -name '*.apk' || true
+              exit 1
+            fi
           fi
           echo "APK: $APK"
           cp "$APK" artifacts/T-apk.apk
           # T-apk CI: unstripped libDDNet.so — по нему addr2line расшифровывает
-          # бэктрейсы из logcat (APK внутри стрипнут AGP, doNotStrip не спасает
-          # для отладки вне устройства)
+          # бэктрейсы из logcat (APK внутри всегда стрипнут AGP)
           UNSTRIPPED=""
-          for c in build-android-release/build_arch/arm64/libDDNet.so; do
+          for c in build_android/build_arch/arm64/libDDNet.so build-android-release/build_arch/arm64/libDDNet.so; do
             if [ -f "$c" ]; then UNSTRIPPED="$c"; break; fi
           done
           if [ -z "$UNSTRIPPED" ]; then
-            UNSTRIPPED=$(find build-android-release -type f -name 'libDDNet.so' ! -path '*/lib/arm64-v8a/*' -size +8M 2>/dev/null | head -1)
+            UNSTRIPPED=$(find build_android build-android-release -type f -name 'libDDNet.so' ! -path '*/lib/arm64-v8a/*' -size +8M 2>/dev/null | head -1)
           fi
           if [ -n "$UNSTRIPPED" ]; then
             cp "$UNSTRIPPED" artifacts/libDDNet-unstripped.so
@@ -270,10 +721,9 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           SHASUM=$(sha256sum artifacts/T-apk.apk | awk '{print $1}')
-          NOTES=$(printf 'Автосборка T-apk (arm64-v8a, пакет com.altynekst.tapk).\nКлиент: Nullcki %s — DDNet 20.2.1 + NullClient + KRX.\nTouch-контролы и меню для телефона уже встроены в клиент.\nSHA-256: %s' "${NULLCKI_SHA:0:10}" "$SHASUM")
           gh release create "tapk-v${GITHUB_RUN_NUMBER}" artifacts/T-apk.apk \
-            --title "T-apk APK v${GITHUB_RUN_NUMBER} (arm64, DDNet 20.2.1)" \
-            --notes "$NOTES" \
+            --title "T-apk APK v${GITHUB_RUN_NUMBER} (arm64)" \
+            --notes "Автосборка T-apk для Android, только 64-бит (arm64-v8a). SHA-256: $SHASUM" \
           || gh release upload "tapk-v${GITHUB_RUN_NUMBER}" artifacts/T-apk.apk --clobber
 
   smoke-test:
@@ -335,7 +785,7 @@ jobs:
             if [ $((i % 6)) = 0 ]; then echo "...жив после $((i*5)) сек (pid $PID)"; fi
           done
           if [ -n "$DEAD" ]; then
-            echo "=== РЕЗУЛЬТАТ: ПРОЦЕСС УМЕР — вылет воспроизведён, смотри логи ниже ==="
+            echo "=== РЕЗУЛЬТАТ: ПРОЦЕСС УМЕР — чёрный экран + вылет воспроизведены ==="
           else
             echo "=== РЕЗУЛЬТАТ: ПРОЦЕСС ЖИВ 300 сек — краша на эмуляторе нет ==="
           fi

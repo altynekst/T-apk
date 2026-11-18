@@ -1,10 +1,10 @@
-# T-apk (Android client, Nullcki)
+# T-apk (Android client, Tater Plus + touch из Nullcki)
 
-Клиент Nullcki (DDNet 20.2.1 + NullClient + KRX) под Android.
+Клиент T-apk = форк Tater Plus (DDNet 17.4 + TaterClient) + бэкпорт touch-логики DDNet 20.2.1 из Nullcki (тач-кнопки, тач-меню). Версия клиента: 20.2.1.
 
-- Сурс НЕ хранится в репо: workflow скачивает пин `59e02c55e7`
-  из `altynekst/Nullcki` и собирает APK (arm64-v8a, пакет com.altynekst.tapk,
-  имя приложения T-apk). Touch-контролы и мобильные меню уже в клиенте.
-- ddnet-libs материализуется из ddnet/ddnet-libs @c0e6703fbc.
+- Сурс НЕ хранится в репо: workflow скачивает пин форка `dcaa51d597`,
+  дополняет апстрим-деревом DDNet 17.4 и применяет бэкпорт touch-логики из
+  Nullcki @59e02c55e7 (touch_controls.* идентичны апстриму 20.2.1).
+- ddnet-libs материализуется из ddnet/ddnet-libs @59d64dbb36 (эпоха 17.4).
 - APK: Releases -> tapk-v<N> -> T-apk.apk; подпись постоянная (CN=T-apk),
   обновления ставятся поверх старых без удаления и потери данных.
